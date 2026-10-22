@@ -1,0 +1,16 @@
+[Unit]
+Description=qmd2 attachment fetch and extraction worker
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Slice=qmd2.slice
+ExecStart=%h/.local/share/qmd2/venv/bin/python -m qmd2.attachments
+MemoryMax=1200M
+Restart=always
+RestartSec=5
+UMask=0077
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=default.target

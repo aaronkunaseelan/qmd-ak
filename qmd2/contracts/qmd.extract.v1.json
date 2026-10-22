@@ -1,0 +1,123 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "qmd.extract.v1",
+  "title": "qmd extract --json",
+  "description": "Extract bytes from a path, stdin (-) or HTTP(S) URL: no archive, queue, state or index. URL input uses the shared link fetcher. Unknown fields are null.",
+  "x-owner": "qmd",
+  "x-consumers": [
+    "steward"
+  ],
+  "type": "object",
+  "required": [
+    "schema",
+    "kind",
+    "text",
+    "model",
+    "pages",
+    "error",
+    "title",
+    "author",
+    "published",
+    "fetched"
+  ],
+  "properties": {
+    "schema": {
+      "const": "qmd.extract.v1"
+    },
+    "kind": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "Extracted document kind (text, ocr or transcript); null when unknown."
+    },
+    "text": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "Complete extracted text, without rendered headers or model metadata."
+    },
+    "model": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "pages": {
+      "type": [
+        "object",
+        "null"
+      ],
+      "description": "Page coverage from the shared extractor, or null for non-paged input.",
+      "required": [
+        "covered",
+        "total",
+        "requested"
+      ],
+      "properties": {
+        "covered": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "total": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "requested": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 1
+        }
+      }
+    },
+    "title": {
+      "type": ["string", "null"],
+      "description": "Article title from web HTML, or null when unknown."
+    },
+    "author": {
+      "type": ["string", "null"],
+      "description": "Article author from web HTML, or null when unknown."
+    },
+    "published": {
+      "type": ["string", "null"],
+      "description": "Publication date as supplied by the extractor, or null when unknown."
+    },
+    "fetched": {
+      "type": ["object", "null"],
+      "description": "Shared fetch outcome; null for local input. Attempts include tunnel startup time and survive queued retries.",
+      "required": ["via", "status", "final_url", "attempts"],
+      "properties": {
+        "via": {"enum": ["direct", "mullvad"]},
+        "status": {"type": ["integer", "null"], "description": "Last HTTP status; null before a response."},
+        "final_url": {"type": "string", "description": "Address after redirects."},
+        "attempts": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["via", "relay", "status", "error", "elapsed_s"],
+            "properties": {
+              "via": {"enum": ["direct", "mullvad"]},
+              "relay": {"type": ["string", "null"]},
+              "status": {"type": ["integer", "null"]},
+              "error": {"type": ["string", "null"]},
+              "elapsed_s": {"type": "number", "minimum": 0}
+            }
+          }
+        }
+      }
+    },
+    "error": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "Short pipeline error code; null on success. Exit 0 on success, 4 on failure."
+    }
+  }
+}

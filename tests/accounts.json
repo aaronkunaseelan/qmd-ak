@@ -1,0 +1,21 @@
+{
+  "x_account": "123",
+  "x_username": "synthetic",
+  "instapaper_account": "1234567",
+  "whatsapp_account": "12025550101:1@s.whatsapp.net",
+  "gmail_account": "pat@example.test",
+  "fathom_account": "pat@example.test",
+  "calendar_account": "pat@example.test",
+  "owner_addresses": [
+    "pat@example.test",
+    "pat@org.example.test"
+  ],
+  "owner_domain": "org.example.test",
+  "file_roots": {
+    "synthetic": "~/workbench/synthetic",
+    "project-folder": "~/workbench/project-folder",
+    "project-txt": "~/workbench/project-txt"
+  },
+  "transcriber_tool": "~/tools/synthetic-audio/transcribe.py",
+  "transcription_env": "~/tools/synthetic-audio/.env"
+}

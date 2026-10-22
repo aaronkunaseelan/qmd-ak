@@ -1,0 +1,182 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "qmd.status.v1",
+  "title": "qmd status --json",
+  "description": "How current and alive qmd is, per source. Times are epoch seconds (UTC). Keys not declared here are qmd internals: not part of the contract, may change without notice, and must not be read by other systems.",
+  "x-owner": "qmd",
+  "x-consumers": [
+    "gsd",
+    "steward",
+    "mech-d"
+  ],
+  "type": "object",
+  "required": [
+    "schema",
+    "installed_git_sha",
+    "at",
+    "alive",
+    "heartbeat_at",
+    "verify",
+    "sources"
+  ],
+  "properties": {
+    "schema": {
+      "const": "qmd.status.v1"
+    },
+    "installed_git_sha": {
+      "type": ["string", "null"],
+      "pattern": "^[0-9a-f]{40}$",
+      "description": "Full commit SHA stamped into the installed package by deploy.sh; null for an unstamped development package. Independent of the checkout and data home."
+    },
+    "at": {
+      "type": "number",
+      "description": "When the CLI computed this answer."
+    },
+    "alive": {
+      "type": "boolean",
+      "description": "ingestd's heartbeat is at most 300 s old at `at`. When false, capture has stopped and every per-source value describes the past."
+    },
+    "heartbeat_at": {
+      "type": [
+        "number",
+        "null"
+      ],
+      "description": "ingestd's last heartbeat; null if never written."
+    },
+    "verify": {
+      "type": "object",
+      "required": [
+        "state",
+        "at",
+        "red_checks"
+      ],
+      "properties": {
+        "state": {
+          "enum": [
+            "green",
+            "red",
+            null
+          ],
+          "description": "The last `qmd verify` result; null if verify has not run or its result is unreadable."
+        },
+        "at": {
+          "type": [
+            "number",
+            "null"
+          ]
+        },
+        "red_checks": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "description": "Names of failing checks; empty when green."
+        }
+      }
+    },
+    "maintenance": {
+      "type": ["object", "null"],
+      "description": "Current rebuild or reparse; null when idle or unknown on an older producer. Field nulls mean unknown except source=null means a full rebuild.",
+      "required": ["source", "stage", "started_at", "last_slice_at"],
+      "properties": {
+        "source": {"type": ["string", "null"]},
+        "stage": {"type": ["string", "null"], "description": "prepare, read, tombstones, swap or waiting_for_lease; null = unknown."},
+        "lease_owner": {"type": ["string", "null"], "description": "When waiting_for_lease, the lease owner file first line; null = unknown."},
+        "started_at": {"type": ["number", "null"]},
+        "last_slice_at": {"type": ["number", "null"], "description": "Start of the most recent work slice; null before work begins."}
+      }
+    },
+    "attachments": {
+      "type": ["object", "null"],
+      "description": "Attachment outcomes; null = unknown.",
+      "properties": {
+        "last_failure_at": {
+          "type": ["number", "null"],
+          "description": "Time of the latest qmd-side outcome counted as a verify failure (including retry-exhausted transient failures and live unavailable voice notes, but never source refusals); null if none known."
+        },
+        "last_failure": {
+          "type": ["object", "null"],
+          "description": "The same outcome that sets last_failure_at; null if none known.",
+          "required": ["id", "reason", "at"],
+          "properties": {
+            "id": {"type": "string"},
+            "reason": {"type": ["string", "null"], "description": "Failure category, exception class or HTTP status; null = unknown. No message content or credentials."},
+            "at": {"type": "number"}
+          }
+        }
+      }
+    },
+    "sources": {
+      "type": "object",
+      "description": "One entry per source system (gmail, whatsapp, calendar, x, instapaper, fathom, files, files-archive, claude, codex, pi, gsd-events, ...).",
+      "additionalProperties": {
+        "type": "object",
+        "required": [
+          "fresh_through",
+          "lag_s",
+          "current",
+          "limit_s",
+          "cadence_s",
+          "error",
+          "rate_limited"
+        ],
+        "properties": {
+          "fresh_through": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "description": "Every item the provider had published before this time is captured or explicitly excluded (D-168). null = unknown. This is the only completeness field: never use last_complete or searchable_through for it. It does not cover items the provider publishes late with an earlier item time; enumerate with qmd.feed.v1 for that."
+          },
+          "lag_s": {
+            "type": ["number", "null"],
+            "minimum": 0,
+            "description": "max(0, source_head - processed_through), the native item-time ingest gap used by verify. null without a completed run or either clock. Not discovery age or at - fresh_through; exclusions count as processed, not searchable documents."
+          },
+          "processed_through": {
+            "type": ["number", "null"],
+            "description": "Newest native item time with an ingest outcome (doc, edit, tombstone or parser exclusion). Compared with capture source_head by verify; not a completeness boundary. null = not yet known."
+          },
+          "parser_exclusions": {
+            "type": "object",
+            "additionalProperties": {"type": "integer", "minimum": 0},
+            "description": "Cumulative live parser exclusions by reason; separate from capture receipt counts."
+          },
+          "valid_until": {
+            "type": ["number", "null"],
+            "description": "Scheduled lane currency expires after this instant: fresh_through + limit_s. Consumers compare their clock to this value instead of recomputing the limit. null when currency is unknown or the lane is unscheduled; not yet required for older producers."
+          },
+          "current": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "at <= valid_until (fresh_through + limit_s). null when fresh_through is unknown or the lane has no scheduled capture."
+          },
+          "limit_s": {
+            "type": "number",
+            "description": "qmd's lateness limit for this source: max(3600, 2 x cadence_s), as verify uses it."
+          },
+          "cadence_s": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "description": "The source's declared lane cadence, the same value verify measures lateness against (readers included, e.g. sessions 15, files 1440); null only for producer lanes with no scheduled capture (cadence 0, e.g. gsd-events)."
+          },
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The provider error of the latest run, or null if the latest run had none. Never carried over from an earlier run."
+          },
+          "rate_limited": {
+            "type": "boolean",
+            "description": "The latest run was cut short by the provider."
+          }
+        }
+      }
+    }
+  }
+}

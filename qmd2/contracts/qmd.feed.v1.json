@@ -1,0 +1,153 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "qmd.feed.v1",
+  "title": "qmd feed --source SYSTEM (--after TOKEN | --since-arrival ISO) [--limit N] --json",
+  "description": "What is new to me: every document version qmd wrote for one source system, in arrival order, resumable by an opaque token. Use this, not time windows, to enumerate; an item published late with an old item time still appears here. Times are epoch seconds (UTC). QMD_UNTIL applies as it does to every read.",
+  "x-owner": "qmd",
+  "x-consumers": [
+    "gsd",
+    "steward"
+  ],
+  "x-invariants": [
+    "Tokens are totally ordered within a source and are never reused.",
+    "No gap: once a token T has been returned, qmd never writes a new version for that source at a position at or before T.",
+    "At least once: a version may be returned again after a restart; consumers dedupe on (id, version).",
+    "--since-arrival T is exact for T at or after the arrival epoch (the first deploy of qmd.feed.v1; versions written earlier carry arrived null): it starts at the first version whose arrival is at or after T. A T before the epoch exits 2 naming the epoch; it never silently starts late.",
+    "--after and --since-arrival are mutually exclusive; giving neither is a usage error (exit 2): a consumer always chooses its start.",
+    "Under QMD_UNTIL, head is the newest position visible under the ceiling, so complete stays reachable for a replaying consumer."
+  ],
+  "type": "object",
+  "required": [
+    "schema",
+    "source",
+    "items",
+    "next",
+    "head",
+    "complete"
+  ],
+  "properties": {
+    "schema": {
+      "const": "qmd.feed.v1"
+    },
+    "source": {
+      "type": "string",
+      "description": "One source system, never a group."
+    },
+    "items": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "token",
+          "id",
+          "item",
+          "source",
+          "kind",
+          "time",
+          "arrived",
+          "title",
+          "from",
+          "thread",
+          "chat",
+          "version",
+          "tombstone",
+          "reparse"
+        ],
+        "properties": {
+          "token": {
+            "type": "string",
+            "description": "Position of this version; pass as --after to continue after it."
+          },
+          "id": {
+            "type": "string",
+            "description": "Native doc id (K1); fetch the document with qmd get."
+          },
+          "item": {
+            "type": "string",
+            "description": "The search-result unit this doc belongs to (K1)."
+          },
+          "source": {
+            "type": "string"
+          },
+          "kind": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "time": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "description": "The item's own time at the source."
+          },
+          "arrived": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "description": "When qmd wrote this version; null for versions written before the arrival epoch (the first deploy of qmd.feed.v1)."
+          },
+          "title": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "from": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Sender address or number as qmd renders it."
+          },
+          "thread": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Provider thread id (Gmail thread); null where the source has none."
+          },
+          "chat": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Canonical WhatsApp chat (phone-number JID); null for other sources."
+          },
+          "version": {
+            "type": "string",
+            "description": "The K2 version of this doc; (id, version) identifies one returned row."
+          },
+          "tombstone": {
+            "type": "boolean",
+            "description": "This version deletes the doc."
+          },
+          "reparse": {
+            "type": "boolean",
+            "description": "Written by a reparse of existing raw records, not by a new capture; content may be unchanged."
+          }
+        }
+      }
+    },
+    "next": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "Token to pass as --after next time: the last returned item's token, or the start position when nothing was returned."
+    },
+    "head": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "The newest position for this source visible to the caller (under QMD_UNTIL when set) at read time; null if none."
+    },
+    "complete": {
+      "type": "boolean",
+      "description": "next == head: the consumer has seen everything written so far."
+    }
+  }
+}

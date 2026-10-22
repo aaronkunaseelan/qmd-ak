@@ -1,0 +1,7 @@
+[Unit]
+Description=qmd2 freshness and delivery checks
+
+[Service]
+Slice=qmd2.slice
+Type=oneshot
+ExecStart=%h/.local/share/qmd2/venv/bin/qmd2 verify --notify
