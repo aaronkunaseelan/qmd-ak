@@ -4,8 +4,12 @@ import os
 from pathlib import Path
 import subprocess
 
+import pytest
+
 
 def test_wireproxy_offline_build(tmp_path):
+    if not (Path(__file__).resolve().parents[1] / 'vendor' / 'wireproxy').is_dir():
+        pytest.skip('vendored wireproxy not present (public export); see docs/config.md')
     root = Path(__file__).resolve().parents[1]
     assert 'vendor/wireproxy' in (root / 'deploy.sh').read_text()
     binary = tmp_path / 'wireproxy'
