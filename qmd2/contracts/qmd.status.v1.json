@@ -81,7 +81,7 @@
       "properties": {
         "source": {"type": ["string", "null"]},
         "stage": {"type": ["string", "null"], "description": "prepare, read, tombstones, swap or waiting_for_lease; null = unknown."},
-        "lease_owner": {"type": ["string", "null"], "description": "When waiting_for_lease, the lease owner file first line; null = unknown."},
+        "lease_owner": {"type": ["string", "null"], "description": "The qmd work holding the host heavy lock; null when waiting or the owner is unknown."},
         "started_at": {"type": ["number", "null"]},
         "last_slice_at": {"type": ["number", "null"], "description": "Start of the most recent work slice; null before work begins."}
       }

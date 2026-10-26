@@ -345,7 +345,8 @@ def test_fetch_receipt_filesystem_subprocess(tmp_path):
 
 
 def test_filesystem_subprocess_tail_spool_and_cli(tmp_path):
-    env = dict(os.environ, HOME=str(tmp_path))
+    lease = tmp_path / 'heavy.lock'
+    env = dict(os.environ, HOME=str(tmp_path), QMD2_HEAVY_LEASE=str(lease))
 
     def run(*args):
         return subprocess.run(
@@ -633,7 +634,6 @@ def test_filesystem_subprocess_tail_spool_and_cli(tmp_path):
         ]
         == 'wa:synthetic:8@s.whatsapp.net:one'
     )
-    (tmp_path / 'workbench/tmp/qmd-target').mkdir(parents=True)
     cursor = store / 'capture-state/whatsapp'
     cursor.mkdir(parents=True)
     (cursor / 'cursor.json').write_text('{}')
@@ -648,22 +648,17 @@ def test_filesystem_subprocess_tail_spool_and_cli(tmp_path):
         json.loads(run('qmd2.cli', '--home', str(store), 'search', 'reset', '--json').stdout) == []
     )
 
-    lease = tmp_path / 'workbench/tmp/qmd-target/heavy.lease'
-    lease.mkdir()
-    (lease / 'owner').write_text('Synthetic import owner\n')
-    (store / 'reindex.request').write_text(
-        json.dumps({'id': 'borrow-test', 'source': 'pi', 'lease_held': True})
-    )
+    (store / 'reindex.request').write_text(json.dumps({'id': 'lock-test', 'source': 'pi'}))
     run('qmd2.ingestd', '--home', str(store), '--no-b2', '--once')
-    assert json.loads((store / 'reindex.result').read_text()) == {'id': 'borrow-test', 'ok': True}
-    assert (lease / 'owner').read_text() == 'Synthetic import owner\n'
+    assert json.loads((store / 'reindex.result').read_text()) == {'id': 'lock-test', 'ok': True}
+    assert lease.read_bytes() == b''
     writable = State(store, True)
     corrupt = Packs(writable, writable=True)
     corrupt.append('doc', 'pi', {'id': 'pi:synthetic#broken'}, b'{"id":"pi:synthetic#broken"}')
     corrupt.sync()
     writable.commit()
     writable.db.close()
-    (store / 'reindex.request').write_text(json.dumps({'id': 'failure-test', 'lease_held': True}))
+    (store / 'reindex.request').write_text(json.dumps({'id': 'failure-test'}))
     run('qmd2.ingestd', '--home', str(store), '--no-b2', '--once')
     assert json.loads((store / 'reindex.result').read_text()) == {
         'id': 'failure-test',
@@ -671,4 +666,8 @@ def test_filesystem_subprocess_tail_spool_and_cli(tmp_path):
         'exception_class': 'KeyError',
         'doc_id': 'pi:synthetic#broken',
     }
-    assert (lease / 'owner').read_text() == 'Synthetic import owner\n'
+    assert lease.read_bytes() == b''
+    import fcntl
+
+    with lease.open('a') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)

@@ -495,7 +495,6 @@ def reindex_command(home, args, parser):
             'id': id,
             'source': source,
             'reset': bool(args.reset_source),
-            'lease_held': os.environ.get('QMD2_REINDEX_LEASE_HELD') == '1',
         },
     )
     reported_wait = False

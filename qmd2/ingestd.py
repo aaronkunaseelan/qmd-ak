@@ -44,9 +44,7 @@ from .sources.sessions import (
 from .state import DEFAULT_HOME, State
 from .status import head_lag
 
-LEASE = Path(
-    os.environ.get('QMD2_HEAVY_LEASE', str(Path.home() / 'workbench/tmp/qmd-target/heavy.lease'))
-).expanduser()
+LEASE = Path(os.environ.get('QMD2_HEAVY_LEASE', '/run/lock/qmd-batch-heavy.lock')).expanduser()
 STATUS_INTERVAL = 60
 
 
@@ -113,6 +111,7 @@ class Ingestd:
             self.state.commit()
         self.maintenance = self.state.get('maintenance')
         self.waiting_for_lease = None
+        self.heavy_lock = None
         self.visible_index = None
         if self.maintenance and not self.maintenance['source']:
             if self.maintenance['stage'] == 'swap':
@@ -793,12 +792,20 @@ class Ingestd:
                 'files_archive_bytes': self.state.get('files-archive-totals', {}),
                 'files_moving': self.state.get('files-moving', 0),
                 'attachments': attachment_status(self.home, self.visible_index or self.index),
-                'maintenance': {
-                    key: self.maintenance.get(key)
-                    for key in ('source', 'stage', 'started_at', 'last_slice_at')
-                }
-                if self.maintenance
-                else self.waiting_for_lease,
+                'maintenance': self.waiting_for_lease
+                or (
+                    {
+                        **{
+                            key: self.maintenance.get(key)
+                            for key in ('source', 'stage', 'started_at', 'last_slice_at')
+                        },
+                        'lease_owner': 'ingestd reindex ' + self.reindex_id
+                        if self.heavy_lock is not None
+                        else None,
+                    }
+                    if self.maintenance
+                    else None
+                ),
             },
         )
 
@@ -1303,36 +1310,26 @@ class Ingestd:
             self.waiting_for_lease = None
             return
         request = json.loads(path.read_text())
-        active = self.maintenance
-        borrowed = request.get('lease_held', False)
-        if not active:
-            if borrowed:
-                if not (LEASE / 'owner').is_file():
-                    atomic(self.home / 'reindex.result', {'id': request['id'], 'ok': False})
-                    path.unlink()
-                    return
-            else:
-                try:
-                    LEASE.mkdir()
-                except FileExistsError:
-                    try:
-                        with (LEASE / 'owner').open() as owner:
-                            lease_owner = owner.readline().strip() or None
-                    except OSError:
-                        lease_owner = None
-                    waiting = dict(
-                        source=request.get('source'),
-                        stage='waiting_for_lease',
-                        started_at=path.stat().st_mtime,
-                        last_slice_at=None,
-                        lease_owner=lease_owner,
-                    )
-                    if waiting != self.waiting_for_lease:
-                        self.waiting_for_lease = waiting
-                        self.last_status = 0
-                        self.publish_status()
-                    return
-                (LEASE / 'owner').write_text('M1 ingestd reindex ' + request['id'] + '\n')
+        if self.heavy_lock is None:
+            lock = LEASE.open('a')
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                lock.close()
+                waiting = dict(
+                    source=request.get('source'),
+                    stage='waiting_for_lease',
+                    started_at=path.stat().st_mtime,
+                    last_slice_at=None,
+                    lease_owner=None,
+                )
+                if waiting != self.waiting_for_lease:
+                    self.waiting_for_lease = waiting
+                    self.last_status = 0
+                    self.publish_status()
+                return
+            self.heavy_lock = lock
+            self.reindex_id = request['id']
         self.waiting_for_lease = None
         try:
             self.reindex_doc_id = None
@@ -1363,9 +1360,8 @@ class Ingestd:
             self.queue_checkpoint('maintenance', None)
             self.commit()
         path.unlink(missing_ok=True)
-        if not borrowed:
-            (LEASE / 'owner').unlink(missing_ok=True)
-            LEASE.rmdir()
+        self.heavy_lock.close()
+        self.heavy_lock = None
 
     def recover_attachment_output(self, row, deadline):
         parent = row['parent']['id']

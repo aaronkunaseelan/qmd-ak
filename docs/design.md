@@ -120,7 +120,7 @@ Links deduplicate by normalized URL and retain parent context. Direct-first fetc
 
 ## 9. K9–K10: Deploy and secrets
 
-One script, `deploy.sh REF`, exports a committed Git ref, builds offline, installs Python non-editably, stamps the commit and installs systemd user units. It does not switch the shared checkout. Rollback uses the same script with a previous ref. The configured shared heavy lease serializes builds and reindex. Public exports need the separately restored, committed wireproxy sources before deploying.
+One script, `deploy.sh REF`, exports a committed Git ref, builds offline, installs Python non-editably, stamps the commit and installs systemd user units. It does not switch the shared checkout. Rollback uses the same script with a previous ref. The configured host heavy flock serializes builds and reindex with other heavy work. Public exports need the separately restored, committed wireproxy sources before deploying.
 
 Configuration and provider credentials are private inputs, never committed examples with real values. Read credentials in-process; errors and logs must never print tokens, environment files or credential values. The files archive can retain sensitive originals even when search hides their content: protect the archive and B2 credentials accordingly.
 

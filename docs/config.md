@@ -48,9 +48,11 @@ VPN: `~/.config/agent-secrets/vpn-browser.env` has `WIREGUARD_PRIVATE_KEY`,
 `QMD2_VERIFY_CLI`: sampled-read executable; `XDG_STATE_HOME`: telemetry directory.
 `QMD_RCLONE_BIN`, `QMD_RCLONE_CONFIG`: history object download executable/config.
 `QMD_GMAIL_BASE_URL`, `QMD_INSTAPAPER_BASE_URL`: test endpoint overrides.
-`QMD2_HEAVY_LEASE`: shared mkdir lock for builds and reindex (prevents concurrent
-heavy work), default `~/workbench/tmp/qmd-target/heavy.lease`.
-`QMD2_DEPLOY_LEASE_HELD=1` / `QMD2_REINDEX_LEASE_HELD=1`: caller already owns it.
+`QMD2_HEAVY_LEASE`: flock file for builds and reindex, default
+`/run/lock/qmd-batch-heavy.lock`: the host's one heavy lock, shared with batch-run,
+Steward and secwatch. Deploy fails immediately if held; reindex waits. Run steps
+sequentially, not nested under a caller-held lock. The empty lock file persists;
+process exit releases the lock without owner files or directory cleanup.
 
 ## wireproxy (not included in public archives)
 Fetch v1.0.9 and verify the checksum in [vendor/wireproxy.md](../vendor/wireproxy.md).

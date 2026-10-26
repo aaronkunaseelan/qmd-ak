@@ -184,14 +184,20 @@ if phase=='start':
  for pack in d.state.packs('raw'):d.packs.seal(pack['stream'],pack['source'],pack['seq'])
  d.commit()
  d.queue_checkpoint('ctx:whatsapp',{'aliases':{'7@lid':'8@s.whatsapp.net'}});d.commit()
- (home/'reindex.request').write_text(json.dumps({'id':'sliced','source':'whatsapp','lease_held':True}))
+ (home/'reindex.request').write_text(json.dumps({'id':'sliced','source':'whatsapp'}))
  d.request(seconds=.000001)
  assert (home/'reindex.request').exists()
  d.last_status=0;d.publish_status()
  status=json.loads((home/'status.json').read_text())['maintenance']
  assert status['source']=='whatsapp' and status['stage'] in ('prepare','read','tombstones')
  assert status['started_at'] <= status['last_slice_at']
- assert set(status)=={'source','stage','started_at','last_slice_at'}
+ assert set(status)=={'source','stage','started_at','last_slice_at','lease_owner'}
+ assert status['lease_owner']=='ingestd reindex sliced'
+ import fcntl
+ with Path(__import__('os').environ['QMD2_HEAVY_LEASE']).open('a') as lock:
+  try:fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
+  except BlockingIOError:pass
+  else:raise AssertionError('reindex did not retain heavy lock across slices')
  assert d.index.lookup('wa:synthetic:7@lid:one')
  root=home/'spool/whatsapp';root.mkdir(parents=True)
  raw=payload('live');(root/'payload').write_bytes(raw)
@@ -199,6 +205,14 @@ if phase=='start':
  (root/'index.jsonl').write_text(json.dumps(entry)+'\\n')
  d.spool();d.commit()
  assert d.index.lookup('wa:synthetic:8@s.whatsapp.net:live')['version']['epoch']==1
+elif phase=='waiting':
+ assert d.maintenance
+ before=d.maintenance.copy()
+ d.request()
+ assert d.maintenance==before
+ status=json.loads((home/'status.json').read_text())['maintenance']
+ assert status['stage']=='waiting_for_lease' and status['lease_owner'] is None
+ assert (home/'reindex.request').exists()
 else:
  assert d.maintenance and d.maintenance['cursor']
  assert d.state.get('epoch:whatsapp')==1
@@ -213,14 +227,19 @@ else:
  assert d.index.lookup('wa:synthetic:9@s.whatsapp.net:vanished')
  assert d.index.lookup('wa:synthetic:8@s.whatsapp.net:live')
 '''
-    env = dict(os.environ, HOME=str(tmp_path))
-    lease = tmp_path / 'workbench/tmp/qmd-target/heavy.lease'
-    lease.mkdir(parents=True)
-    (lease / 'owner').write_text('synthetic owner\n')
+    lease = tmp_path / 'heavy.lock'
+    env = dict(os.environ, HOME=str(tmp_path), QMD2_HEAVY_LEASE=str(lease))
     store = tmp_path / 'store'
-    for phase in ('start', 'resume'):
-        subprocess.run([sys.executable, '-c', script, str(store), phase], env=env, check=True)
-    assert (lease / 'owner').read_text() == 'synthetic owner\n'
+    import fcntl
+
+    subprocess.run([sys.executable, '-c', script, str(store), 'start'], env=env, check=True)
+    with lease.open('a') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        subprocess.run([sys.executable, '-c', script, str(store), 'waiting'], env=env, check=True)
+    subprocess.run([sys.executable, '-c', script, str(store), 'resume'], env=env, check=True)
+    assert lease.read_bytes() == b''
+    with lease.open('a') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     assert len(Index(store).search('lighthouse')) == 4
 
 

@@ -4,14 +4,9 @@ set -euo pipefail
 ref=${1:?usage: deploy.sh git-ref}
 repo=$(cd -- "$(dirname -- "$0")" && pwd)
 build=$(mktemp -d)
-owns_lease=0
-lease=${QMD2_HEAVY_LEASE:-"$HOME/workbench/tmp/qmd-target/heavy.lease"}
+lease=${QMD2_HEAVY_LEASE:-/run/lock/qmd-batch-heavy.lock}
 cleanup() {
   rm -rf -- "$build"
-  if [[ $owns_lease == 1 ]]; then
-    rm -f "$lease/owner"
-    rmdir "$lease"
-  fi
 }
 trap cleanup EXIT
 sha=$(git -C "$repo" rev-parse --verify "$ref^{commit}")
@@ -23,28 +18,20 @@ printf '\ninstalled_git_sha = "%s"\n' "$sha" >> "$build/qmd2/__init__.py"
 runtime="$HOME/.local/share/qmd2"
 mkdir -p "$runtime" "$runtime/bin" "$HOME/.local/bin" "$HOME/.config/systemd/user"
 if [[ -f "$build/capture/go.mod" ]]; then
-  if [[ ${QMD2_DEPLOY_LEASE_HELD:-0} == 1 ]]; then
-    test -f "$lease/owner"
-  else
-    if ! mkdir "$lease" 2>/dev/null; then
-      echo 'deploy: heavy lease occupied' >&2
-      exit 4
-    fi
-    owns_lease=1
-    printf 'deploy Go build\n' > "$lease/owner"
+  # Builds never inherit the lock: a lingering child (go's helpers) would keep the host's heavy lock held after deploy.
+  exec {heavy_lock}>>"$lease"
+  if ! flock -n "$heavy_lock"; then
+    echo 'deploy: heavy lock held' >&2
+    exit 4
   fi
   (cd "$build/vendor/wireproxy" && GOPROXY=off GOSUMDB=off GOTOOLCHAIN=local CGO_ENABLED=0 \
     go build -mod=vendor -trimpath -ldflags='-s -w -X main.version=v1.0.9' \
-    -o "$runtime/bin/wireproxy" ./cmd/wireproxy)
-  (cd "$build/capture" && GOPROXY=off go build -o "$runtime/bin/qmd2-fetch" ./cmd/qmd2-fetch)
+    -o "$runtime/bin/wireproxy" ./cmd/wireproxy) {heavy_lock}>&-
+  (cd "$build/capture" && GOPROXY=off go build -o "$runtime/bin/qmd2-fetch" ./cmd/qmd2-fetch) {heavy_lock}>&-
   if [[ -d "$build/capture/cmd/wa-meow" ]]; then
-    (cd "$build/capture" && GOPROXY=off go build -o "$runtime/bin/wa-meow" ./cmd/wa-meow)
+    (cd "$build/capture" && GOPROXY=off go build -o "$runtime/bin/wa-meow" ./cmd/wa-meow) {heavy_lock}>&-
   fi
-  if [[ $owns_lease == 1 ]]; then
-    rm "$lease/owner"
-    rmdir "$lease"
-    owns_lease=0
-  fi
+  exec {heavy_lock}>&-
 fi
 systemctl --user stop qmd2-attachments.service 2>/dev/null || true
 systemctl --user stop qmd2-ingestd.service 2>/dev/null || true

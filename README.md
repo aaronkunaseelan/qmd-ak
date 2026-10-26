@@ -93,8 +93,6 @@ Install from a reviewed release commit in a Git checkout containing its required
 
 ```sh
 uv sync --frozen --offline
-# Choose an existing parent directory for the shared build/reindex lease.
-export QMD2_HEAVY_LEASE="$HOME/.cache/qmd-heavy.lease"
 mkdir -p "$HOME/.cache"
 ./deploy.sh <release-commit>
 ln -sfn "$HOME/.local/bin/qmd2" "$HOME/.local/bin/qmd"
@@ -102,7 +100,7 @@ qmd status --json
 qmd verify
 ```
 
-`deploy.sh` exports the committed ref, builds Go binaries offline, installs Python non-editably into `~/.local/share/qmd2/venv`, stamps the installed commit and installs user units. Use the same lease setting for reindex operations. It enables `qmd2-ingestd.service`, `qmd2-attachments.service` and `qmd2-verify.timer`; the timer invokes `qmd2-verify.service` every five minutes. Background work uses `qmd2.slice`. This is an installed copy, not an editable checkout; rollback uses `./deploy.sh <previous-commit>`.
+`deploy.sh` exports the committed ref, builds Go binaries offline, installs Python non-editably into `~/.local/share/qmd2/venv`, stamps the installed commit and installs user units. Builds and reindex take the host's one heavy lock via flock, default `/run/lock/qmd-batch-heavy.lock` (override with `QMD2_HEAVY_LEASE`). Deploy fails immediately if held; reindex waits. Run steps sequentially, never nested under a caller-held lock. It enables `qmd2-ingestd.service`, `qmd2-attachments.service` and `qmd2-verify.timer`; the timer invokes `qmd2-verify.service` every five minutes. Background work uses `qmd2.slice`. This is an installed copy, not an editable checkout; rollback uses `./deploy.sh <previous-commit>`.
 
 Check both `alive` and the age/state of verify, then each source's `fresh_through`, `current`, `error` and `rate_limited`. An active unit alone is not proof of complete capture. Provider integrations and external producers must be configured before end-to-end health is meaningful. No prebuilt release artifact or provisioned provider account is implied by these instructions.
 
