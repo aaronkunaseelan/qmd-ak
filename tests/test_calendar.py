@@ -81,6 +81,43 @@ def test_calendar_named_zone_filesystem(tmp_path, local, zone, expected):
         daemon.lock.close()
 
 
+@pytest.mark.parametrize(
+    'end,where,expected',
+    [
+        ({'date': '2026-10-14'}, 'Synthetic Hall', '2026-10-14'),
+        ({'dateTime': '2026-10-14T12:00:00+03:00'}, 'Synthetic Hall', '2026-10-14T09:00:00+00:00'),
+        ({}, '', None),
+    ],
+)
+def test_calendar_browse_subprocess_pack_edges(tmp_path, end, where, expected):
+    import subprocess
+    import sys
+    from qmd2.ingestd import Ingestd
+
+    raw = json.dumps(
+        dict(id='event', start={'date': '2026-10-13'}, end=end, location=where)
+    ).encode()
+    daemon = Ingestd(tmp_path, remote=False)
+    try:
+        daemon.record('calendar', raw, {'key': 'synthetic:event', 'time': '2026-10-13'})
+        daemon.commit()
+        result = subprocess.run(
+            [sys.executable, '-m', 'qmd2.cli', '--home', str(tmp_path), 'browse', '--json'],
+            check=True,
+            capture_output=True,
+        )
+        row = json.loads(result.stdout)['results'][0]
+        assert row['where'] == (where or None) and row['end'] == expected
+        assert 'pointer' not in row and 'version' not in row
+        assert 'context' in row and 'item' in row
+        assert daemon.index.lookup(row['id'])['pointer']
+    finally:
+        daemon.upload_pool.shutdown()
+        daemon.index.writer.wait_merging_threads()
+        daemon.state.db.close()
+        daemon.lock.close()
+
+
 def test_calendar_spool_chain(tmp_path):
     import hashlib
     from qmd2.ingestd import Ingestd

@@ -6,7 +6,24 @@ from pathlib import Path
 
 from . import installed_git_sha
 from .sources import SOURCES
-from .verify import lateness_limit
+
+
+def lateness_limit(cadence):
+    return max(3600, 2 * (cadence or 0))
+
+
+def currency(row, now):
+    cadence = row.get('cadence_s') or None
+    fresh = row.get('fresh_through')
+    limit = lateness_limit(cadence)
+    valid_until = fresh + limit if cadence and fresh is not None else None
+    return dict(
+        fresh_through=fresh,
+        valid_until=valid_until,
+        current=now <= valid_until if valid_until is not None else None,
+        limit_s=limit,
+        cadence_s=cadence,
+    )
 
 
 def head_lag(row):
@@ -37,18 +54,11 @@ def view(home, status):
     cadences = {name: cadence or None for name, _, _, cadence, *_ in SOURCES}
     for name, original in sources.items():
         row = dict(original)
-        cadence = row.get('cadence_s', cadences.get(name)) or None
-        limit = lateness_limit(cadence)
-        fresh = row.get('fresh_through')
-        valid_until = fresh + limit if cadence and fresh is not None else None
+        row.setdefault('cadence_s', cadences.get(name))
         row.update(
             lag_s=head_lag(row),
             parser_exclusions=row.get('parser_exclusions', {}),
-            fresh_through=fresh,
-            valid_until=valid_until,
-            current=now <= valid_until if valid_until is not None else None,
-            limit_s=limit,
-            cadence_s=cadence,
+            **currency(row, now),
             error=row.get('error') or None,
             rate_limited=bool(row.get('rate_limited', False)),
         )

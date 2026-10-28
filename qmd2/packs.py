@@ -28,6 +28,22 @@ def room(path, size=0):
         raise OSError('disk below 8 GB write floor')
 
 
+def payload_integrity(body, expected=None):
+    if isinstance(body, bytes):
+        size, sha = len(body), hashlib.sha256(body).hexdigest()
+    else:
+        start = body.tell()
+        digest, size = hashlib.sha256(), 0
+        while chunk := body.read(1024 * 1024):
+            digest.update(chunk)
+            size += len(chunk)
+        sha = digest.hexdigest()
+        body.seek(start)
+    if expected is not None and (size != expected['bytes'] or sha != expected['sha256']):
+        raise ValueError('spool payload size or SHA256 mismatch')
+    return size, sha
+
+
 def records(f):
     while True:
         off = f.tell()
@@ -53,6 +69,7 @@ class Packs:
     def __init__(self, state, b2=None, writable=False):
         self.state, self.home, self.b2 = state, state.home / 'packs', b2
         self.active, self.files = {}, {}
+        self.seal_errors = {}
         self.remote = {}
         if writable:
             self.home.mkdir(parents=True, exist_ok=True)
@@ -66,7 +83,10 @@ class Packs:
             for row in rows:
                 key = row['stream'], row['source']
                 if not row['sealed'] and row['seq'] < newest[key]:
-                    self.seal(*key, row['seq'])
+                    try:
+                        self.seal(*key, row['seq'])
+                    except Exception:
+                        pass  # seal retains the failure for health; independent packs continue.
             state.commit()
 
     def catalog_remote(self):
@@ -137,9 +157,16 @@ class Packs:
             f.truncate(end)
             f.flush()
             os.fsync(f.fileno())
+        if end == 0:
+            self.seal(stream, source, seq)
+            return
         self.state.db.execute(
             'INSERT OR IGNORE INTO packs VALUES (?,?,?,?,?,0,0,NULL)',
             (stream, source, seq, end, path.stat().st_mtime),
+        )
+        self.state.db.execute(
+            'UPDATE packs SET size=? WHERE stream=? AND source=? AND seq=?',
+            (end, stream, source, seq),
         )
         self.active[stream, source] = max(seq, self.active.get((stream, source), -1))
 
@@ -178,20 +205,10 @@ class Packs:
         self.active[stream, source] = seq
         return seq
 
-    def append(self, stream, source, header, body):
+    def append(self, stream, source, header, body, expected=None):
+        size, sha = payload_integrity(body, expected)
         if isinstance(body, bytes):
-            size = len(body)
-            sha = hashlib.sha256(body).hexdigest()
             body = io.BytesIO(body)
-        else:
-            start = body.tell()
-            sha256 = hashlib.sha256()
-            size = 0
-            while chunk := body.read(1024 * 1024):
-                sha256.update(chunk)
-                size += len(chunk)
-            sha = sha256.hexdigest()
-            body.seek(start)
         room(self.home, size * 2 + 4096)
         key = stream, source
         if size >= LARGE:
@@ -231,33 +248,46 @@ class Packs:
             os.fsync(f.fileno())
 
     def seal(self, stream, source, seq):
-        key = stream, source
-        if key in self.files:
-            f = self.files.pop(key)
-            f.flush()
-            os.fsync(f.fileno())
-            f.close()
-        src, dst = self.path(stream, source, seq), self.path(stream, source, seq, True)
-        if not src.exists():
-            return
-        room(self.home, src.stat().st_size + 4096)
-        dst.parent.mkdir(parents=True, exist_ok=True)
-        with src.open('rb') as f, dst.with_suffix('.tmp').open('wb') as out:
-            frames = self.write_pack_frames(src, f, out)
-            table = b''.join(struct.pack('<II', f[3], f[1]) for f in frames)
-            table += struct.pack('<IBI', len(frames), 0, 0x8F92EAB1)
-            out.write(struct.pack('<II', 0x184D2A5E, len(table)) + table)
-            out.flush()
-            os.fsync(out.fileno())
-        os.replace(dst.with_suffix('.tmp'), dst)
-        self.state.db.execute(
-            'UPDATE packs SET sealed=1,frames=? WHERE stream=? AND source=? AND seq=?',
-            (dumps(frames), stream, source, seq),
-        )
-        self.state.commit()
-        src.unlink()
-        if self.active.get(key) == seq:
-            self.active.pop(key)
+        self.seal_errors.pop((stream, source, seq), None)
+        try:
+            key = stream, source
+            if key in self.files:
+                f = self.files.pop(key)
+                f.flush()
+                os.fsync(f.fileno())
+                f.close()
+            src, dst = self.path(stream, source, seq), self.path(stream, source, seq, True)
+            if not src.exists():
+                return
+            if src.stat().st_size == 0:
+                src.unlink()
+                self.state.db.execute(
+                    'DELETE FROM packs WHERE stream=? AND source=? AND seq=?', (stream, source, seq)
+                )
+                if self.active.get(key) == seq:
+                    self.active.pop(key)
+                return
+            room(self.home, src.stat().st_size + 4096)
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            with src.open('rb') as f, dst.with_suffix('.tmp').open('wb') as out:
+                frames = self.write_pack_frames(src, f, out)
+                table = b''.join(struct.pack('<II', f[3], f[1]) for f in frames)
+                table += struct.pack('<IBI', len(frames), 0, 0x8F92EAB1)
+                out.write(struct.pack('<II', 0x184D2A5E, len(table)) + table)
+                out.flush()
+                os.fsync(out.fileno())
+            os.replace(dst.with_suffix('.tmp'), dst)
+            self.state.db.execute(
+                'UPDATE packs SET sealed=1,frames=? WHERE stream=? AND source=? AND seq=?',
+                (dumps(frames), stream, source, seq),
+            )
+            self.state.commit()
+            src.unlink()
+            if self.active.get(key) == seq:
+                self.active.pop(key)
+        except Exception as error:
+            self.seal_errors[stream, source, seq] = type(error).__name__
+            raise
 
     def write_pack_frames(self, src, f, out):
         frames, buffer = [], bytearray()
@@ -412,7 +442,11 @@ class Packs:
             if not row['sealed'] and (
                 row['size'] >= SEAL or time.time() - row['created'] >= SEAL_AGE
             ):
-                self.seal(row['stream'], row['source'], row['seq'])
+                key = row['stream'], row['source'], row['seq']
+                try:
+                    self.seal(*key)
+                except Exception:
+                    pass  # seal retains the failure for health; independent packs continue.
         uploaded = 0
         for row in list(self.state.packs()):
             if not row['sealed'] or row['uploaded'] or not self.b2 or uploaded >= max_uploads:

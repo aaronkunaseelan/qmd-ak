@@ -16,6 +16,8 @@ from pathlib import Path
 from .state import DEFAULT_HOME
 from .exits import EXIT_CODES
 from .sources import head_kind
+from .status import currency, lateness_limit
+from .packs import SEAL_AGE
 
 
 REASONS = {
@@ -42,6 +44,8 @@ REASONS = {
     'raw_get': 'Cold file raw hash check failed',
     'state': 'Verify state could not be read',
     'apply': 'Could not apply qmd2 slice CPU weight',
+    'blocked': 'Spool ingestion blocked',
+    'seal': 'Pack sealing failed',
 }
 
 
@@ -54,6 +58,12 @@ def reason(name, failed, status=None):
     if check == 'capture':
         receipt = row.get('receipt') or {}
         return f"{message}: error={receipt.get('error') or row.get('error') or 'unknown'}; failed={receipt.get('failed')}"
+    if name == 'seal:late':
+        return 'Open pack overdue for sealing'
+    if name == 'spool:blocked':
+        return message + ': ' + json.dumps((status or {}).get('spool_errors', {}), sort_keys=True)
+    if name == 'packs:seal':
+        return message + ': ' + json.dumps((status or {}).get('seal_errors', []), sort_keys=True)
     if name == 'attachments:failure':
         failure = ((status or {}).get('attachments') or {}).get('last_failure') or {}
         return f"{message}: id={failure.get('id') or 'unknown'}; reason={failure.get('reason') or 'unknown'}"
@@ -159,10 +169,6 @@ def metrics(home, status, now):
     return out
 
 
-def lateness_limit(cadence):
-    return max(3600, 2 * (cadence or 0))
-
-
 def evaluate(status, now, checks=None, observed=None):
     checks = checks if checks is not None else []
 
@@ -185,6 +191,12 @@ def evaluate(status, now, checks=None, observed=None):
     age_check(status.get('heartbeat_at'), 300, 'ingestd:heartbeat')
     check(
         any(r.get('sealed', False) and r['age_s'] > 7200 for r in status['backlog']), 'upload:late'
+    )
+    check(bool(status.get('spool_errors')), 'spool:blocked')
+    check(bool(status.get('seal_errors')), 'packs:seal')
+    check(
+        any(not r.get('sealed', False) and r['age_s'] > SEAL_AGE for r in status['backlog']),
+        'seal:late',
     )
     attachments = status.get('attachments')
     if attachments is not None:
@@ -238,7 +250,12 @@ def evaluate(status, now, checks=None, observed=None):
             (not receipt['ok'] or receipt['failed'] > 0) and not receipt.get('rate_limited', False),
             source + ':capture',
         )
-        age_check(row.get('last_complete'), limit, source + ':discovery')
+        freshness = currency(row, now)
+        check(
+            freshness['current'] is not True,
+            source + ':discovery',
+            'Unknown timestamp' if freshness['valid_until'] is None else None,
+        )
         stamp = row.get('oldest_failed')
         if stamp is not None:
             age_check(stamp, limit, source + ':unresolved')

@@ -53,7 +53,7 @@ SOURCES = [
         'x',
         parse_x,
         fetch('x', configured('x_account')),
-        720,
+        7200,
         600,
     ),
     (

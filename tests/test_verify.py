@@ -8,6 +8,9 @@ import sys
 import time
 import pytest
 
+from qmd2.ingestd import replace_receipt
+from qmd2.status import view
+
 
 @pytest.fixture(autouse=True)
 def systemctl_edge(tmp_path, monkeypatch):
@@ -57,6 +60,7 @@ def test_delivery(tmp_path):
                 receipt=receipt,
                 cadence_s=15,
                 last_complete=now - 7200,
+                fresh_through=now - 7200,
                 last_complete_at=now - 7200,
                 error='provider HTTP 503',
             ),
@@ -64,6 +68,7 @@ def test_delivery(tmp_path):
                 receipt=receipt,
                 cadence_s=15,
                 last_complete=now,
+                fresh_through=now,
                 last_complete_at=now,
                 error='not red',
             ),
@@ -151,6 +156,7 @@ def test_capture_limits_filesystem(tmp_path):
                     receipt={**receipt, 'rate_limited': limited, 'error': 'FileNotFoundError'},
                     cadence_s=cadence,
                     last_complete=now - age if age is not None else None,
+                    fresh_through=now - age if age is not None else None,
                     last_complete_at=now - age if age is not None else None,
                     source_head=None,
                     processed_through=None,
@@ -188,6 +194,18 @@ def test_unscheduled_integrity_and_newest_get(tmp_path, monkeypatch, source):
     daemon = Ingestd(tmp_path, remote=False)
     try:
         daemon.record(source, b'null', {'key': 'synthetic', 'time': '2026-10-20'})
+        if source == 'manual':
+            # Malformed manual input yields an attachment-source error doc, not a manual row.
+            doc = dict(
+                id='manual:synthetic',
+                item='manual:synthetic',
+                source='manual',
+                group='files',
+                kind='text',
+                time='2026-10-20',
+                parts=[dict(kind='authored', text='Synthetic manual body')],
+            )
+            daemon.record('manual', json.dumps(doc).encode(), {'key': doc['id']})
         daemon.commit()
         now = time.time()
         row = daemon.source_status(source, 0, daemon.index, now)
@@ -269,6 +287,7 @@ def test_archive_head_applicability_filesystem(tmp_path, monkeypatch):
             failed=0,
             source_head=now,
             last_complete=now,
+            fresh_through=now,
         )
         for source, cadence, applicable in (
             ('files-archive', 86400, False),
@@ -296,7 +315,7 @@ def test_archive_head_applicability_filesystem(tmp_path, monkeypatch):
                 monkeypatch.setenv('QMD2_VERIFY_CLI', str(tmp_path / 'missing-cli'))
                 check_newest(tmp_path, status, checks)
                 assert not checks
-            row['last_complete'] = None
+            row['fresh_through'] = None
             assert source + ':discovery' in evaluate(status, now)
     finally:
         daemon.upload_pool.shutdown()
@@ -394,3 +413,79 @@ def test_priority_subprocess(tmp_path):
         assert 'priority:apply' in json.loads(result.stdout)['red_checks']
         assert json.loads((tmp_path / 'verify.json').read_text())['priority_level'] == 0
         assert len(calls.read_text().splitlines()) == count
+
+
+def healthy_status(now, receipt):
+    return {
+        'written_at': now,
+        'heartbeat_at': now,
+        'backlog': [],
+        'sources': {
+            'x': {
+                **receipt,
+                'receipt': receipt,
+                'cadence_s': 7200,
+                'processed_through': now,
+                'source_head': now,
+            }
+        },
+    }
+
+
+@pytest.mark.parametrize('freshness', ['expired', 'unknown', 'current'])
+def test_discovery_requires_current_completeness_subprocess(tmp_path, freshness):
+    now = time.time()
+    boundary = (
+        None if freshness == 'unknown' else now - (10 * 3600 if freshness == 'expired' else 60)
+    )
+    receipt = replace_receipt(
+        {'fresh_through': boundary},
+        {
+            'ok': True,
+            'head_complete': True,
+            'rate_limited': True,
+            'backfill_error': 'bird request allowance exhausted',
+            'enumerated': 1,
+            'written': 0,
+            'unchanged': 1,
+            'excluded': 0,
+            'failed': 0,
+            'source_head': now,
+        },
+        now,
+    )
+    status = healthy_status(now, receipt)
+    contract = view(tmp_path, status)['sources']['x']
+    assert (contract['current'] is True) == (freshness == 'current')
+    (tmp_path / 'status.json').write_text(json.dumps(status))
+    (tmp_path / 'verify.json').write_text(
+        json.dumps(
+            {
+                'priority_level': 0,
+                'cold_at': now,
+                'cold_ok': True,
+                'raw_ok': True,
+            }
+        )
+    )
+    systemctl = tmp_path / 'systemctl'
+    systemctl.write_text('#!/bin/sh\nexit 0\n')
+    systemctl.chmod(0o700)
+    result = subprocess.run(
+        [sys.executable, '-m', 'qmd2.verify', '--home', str(tmp_path)],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        env={
+            **os.environ,
+            'PATH': str(tmp_path) + os.pathsep + os.environ['PATH'],
+            'XDG_STATE_HOME': str(tmp_path / 'telemetry-home'),
+        },
+    )
+    assert result.returncode == 0, result.stderr
+    outcome = json.loads(result.stdout)
+    assert ('x:discovery' in outcome['red_checks']) == (freshness != 'current'), (
+        f'{freshness}: contract_current={contract["current"]}, '
+        f'verify={outcome["state"]}, red_checks={outcome["red_checks"]}'
+    )

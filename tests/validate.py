@@ -7,14 +7,15 @@ Returns a list of problems; empty means valid. CLI: python3 -I validate.py CONTR
 """
 
 import json
+import math
 import sys
 
 TYPES = {'object': dict, 'array': list, 'string': str, 'boolean': bool, 'null': type(None)}
 
 
 def is_type(value, name):
-    if name == 'number':
-        return type(value) in (int, float)
+    if name == 'number':  # JSON allows no Infinity/NaN; Python decodes 1e309 to inf
+        return type(value) is int or (type(value) is float and math.isfinite(value))
     if name == 'integer':
         return type(value) is int
     return type(value) is TYPES[name]

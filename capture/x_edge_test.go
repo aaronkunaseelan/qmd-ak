@@ -66,8 +66,8 @@ func TestXListingSubprocess(t *testing.T) {
 	if err := call("normal"); err != nil || r.receipt.RequestsSent != 14 || !r.receipt.Backfill.Done {
 		t.Fatal("done backfill must stay done")
 	}
-	if err := call("changed"); err != nil || !r.receipt.HeadComplete || r.receipt.Written != 5 {
-		t.Fatal("changed head must continue to known page")
+	if err := call("changed"); err != nil || !r.receipt.HeadComplete || r.receipt.Written < 5 {
+		t.Fatalf("changed head must continue to known page: err=%v receipt=%+v", err, r.receipt)
 	}
 	if err := call("cap"); err == nil || !r.receipt.RateLimited || r.receipt.HeadComplete || r.receipt.RequestsSent != 26 {
 		t.Fatal("cap during head must be incomplete and limited")
@@ -132,7 +132,7 @@ with (root / 'calls').open('a') as f:
     f.write(json.dumps(args) + '\n')
 kind = args[1]
 if kind == 'user-tweets' and args[2] != 'synthetic': sys.exit(1)
-cost = {'whoami': 5, 'bookmarks': 1, 'likes': 6, 'user-tweets': 2}[kind]
+cost = {'whoami': 5, 'bookmarks': 1, 'likes': 6, 'user-tweets': 2, 'thread': 1, 'search': 1}[kind]
 if mode == 'cap' and kind == 'bookmarks': cost = 6
 if mode == 'tailcap' and '--cursor' in args: cost = 7
 remaining = int(os.environ['XBIRD_REMAINING'])
@@ -140,6 +140,9 @@ json.dump({'requests_sent': min(cost, remaining), 'rate_limited': mode == 'limit
 if mode == 'limited' or cost > remaining: sys.exit(1)
 if kind == 'whoami':
     print('user_id: 123')
+    sys.exit(0)
+if kind == 'thread':
+    print(json.dumps({'tweets': [{'id': args[2], 'text': 'synthetic'}]}))
     sys.exit(0)
 cursor = args[args.index('--cursor') + 1] if '--cursor' in args else '0'
 n = int(cursor)

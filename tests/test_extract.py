@@ -79,6 +79,39 @@ def test_extract_filesystem_cli(tmp_path):
         assert snapshot() == before
 
 
+def test_extract_v1_additions_are_optional_subprocess(tmp_path):
+    command = [sys.executable, '-m', 'qmd2.cli']
+    contract = tmp_path / 'extract-contract.json'
+    contract.write_bytes(subprocess.check_output(command + ['contract', 'qmd.extract.v1']))
+    produced = subprocess.run(
+        command + ['extract', '-', '--json'],
+        input=b'Synthetic lighthouse',
+        capture_output=True,
+        check=True,
+    )
+    payload = json.loads(produced.stdout)
+    additions = ('title', 'author', 'published', 'fetched')
+    cases = [(payload, True)]
+    cases += [
+        ({key: value for key, value in payload.items() if key != field}, True)
+        for field in additions
+    ]
+    cases.append(({key: value for key, value in payload.items() if key not in additions}, True))
+    cases += [({**payload, field: 123}, False) for field in additions]
+    cases += [
+        ({key: value for key, value in payload.items() if key != field}, False)
+        for field in ('schema', 'kind', 'text', 'model', 'pages', 'error')
+    ]
+    for candidate, valid in cases:
+        result = subprocess.run(
+            [sys.executable, '-I', str(Path(__file__).with_name('validate.py')), str(contract)],
+            input=json.dumps(candidate),
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == (0 if valid else 1), result.stdout
+
+
 def test_extract_metadata_subprocess(tmp_path):
     source = tmp_path / 'article.html'
     source.write_text(

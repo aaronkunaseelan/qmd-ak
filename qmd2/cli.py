@@ -40,7 +40,15 @@ def read_command(home, args):
         results, missing, failed = [], False, False
         for identifier in identifiers:
             try:
-                if getattr(args, 'materialise', False):
+                if (
+                    getattr(args, 'materialise', False)
+                    and identifier.startswith('x:')
+                    and '/att/' not in identifier
+                ):
+                    from .sources.x import demand
+
+                    docs = [demand(home, identifier)]
+                elif getattr(args, 'materialise', False):
                     from .attachments import demand
 
                     row = demand(
@@ -98,6 +106,19 @@ def grep_command(reader, args):
 
 def read_result(reader, args, identifier, docs):
     heads = int(args.attachments.split(':')[1]) if getattr(args, 'attachments', None) else None
+    if args.json:
+        docs = [
+            dict(
+                doc,
+                attachments=[
+                    dict(ref, head=reader.attachment_head_data(ref, heads))
+                    for ref in doc['attachments']
+                ],
+            )
+            if doc.get('attachments')
+            else doc
+            for doc in docs
+        ]
     output = '\n\n'.join(
         (
             f"=== {d['id']}{' [asked]' if d['id'] == identifier else ''} ===\n"
@@ -161,7 +182,7 @@ def add_read_parsers(commands):
     get.add_argument(
         '--materialise',
         action='store_true',
-        help='Capture/extract and store attachment or URL; cached terminal results are reused. Fetches may use network; Azure audio/OCR is paid; HTML/text decode is local.',
+        help='Refresh an X post and author context now, or capture/extract and store attachment or URL (cached terminal results reused). Fetches may use network; Azure audio/OCR is paid; HTML/text decode is local.',
     )
     get.add_argument('--pages', type=int)
     get.add_argument('--no-quoted', action='store_true')
@@ -328,7 +349,7 @@ def search_command(home, args):
         args.query or args.lex, args.source, args.since, args.limit, args.until
     )
     if args.json:
-        print(dumps(rows))
+        print(dumps([discovery_row(row) for row in rows]))
     else:
         for row in rows:
             print(
@@ -453,13 +474,30 @@ def raw_command(home, args, parser):
     return EXIT_CODES['ok'][0]
 
 
+def discovery_row(row):
+    return {k: v for k, v in row.items() if k not in ('pointer', 'version')}
+
+
 def browse_command(home, args):
     rows = Index(home).browse(args.source, args.since, args.until, args.limit, args.cursor)
-    print(
-        dumps({'results': rows, 'cursor': args.cursor + len(rows)})
-        if args.json
-        else '\n'.join(f"{r['id']}  {r['title']}" for r in rows)
-    )
+    if args.json:
+        reader = Reader(home)
+        try:
+            for row in rows:
+                if row['source'] == 'calendar':
+                    doc = reader.read(row)
+                    row.update(
+                        where=doc.get('where') or None, end=doc.get('context', {}).get('end')
+                    )
+        finally:
+            reader.close()
+        print(
+            dumps(
+                {'results': [discovery_row(row) for row in rows], 'cursor': args.cursor + len(rows)}
+            )
+        )
+    else:
+        print('\n'.join(f"{r['id']}  {r['title']}" for r in rows))
 
 
 def status_command(home, args):

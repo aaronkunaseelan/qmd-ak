@@ -484,7 +484,10 @@ def test_filesystem_subprocess_tail_spool_and_cli(tmp_path):
     hit = json.loads(run('qmd2.cli', '--home', str(store), 'search', 'archived', '--json').stdout)[
         0
     ]
-    doc = json.loads(packs.read(hit['pointer'])[1])
+    assert 'pointer' not in hit and 'version' not in hit
+    doc = json.loads(run('qmd2.cli', '--home', str(store), 'get', hit['id'], '--json').stdout)[
+        'docs'
+    ][0]
     assert packs.read(doc['raw'])[1] == envelope
 
     from qmd2.ingestd import Ingestd
@@ -535,7 +538,9 @@ def test_filesystem_subprocess_tail_spool_and_cli(tmp_path):
             )[0]
             assert hit['id'] == item
             assert term in run('qmd2.cli', '--home', str(store), 'get', item).stdout
-            doc = json.loads(packs.read(hit['pointer'])[1])
+            doc = json.loads(run('qmd2.cli', '--home', str(store), 'get', item, '--json').stdout)[
+                'docs'
+            ][0]
             assert term.encode() in packs.read(doc['raw'])[1]
 
         # A bounded walk publishes the last completed run, not a failed partial run.

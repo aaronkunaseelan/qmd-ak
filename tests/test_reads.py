@@ -210,6 +210,8 @@ def test_read_subprocess_pack_edges(tmp_path):
         data = json.loads(result.stdout)
         rows = data['results'] if isinstance(data, dict) else data
         assert all(r['time'][:10] <= '2026-08-17' for r in rows)
+        assert all('pointer' not in r and 'version' not in r for r in rows)
+        assert all('context' in r and 'item' in r for r in rows)
     bad = subprocess.run(
         command + ['search', 'harbor'], capture_output=True, env=dict(env, QMD_UNTIL='broken')
     )

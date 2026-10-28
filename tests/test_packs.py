@@ -1,5 +1,6 @@
 import hashlib
 import io
+import json
 import os
 import time
 import uuid
@@ -153,7 +154,10 @@ def test_corrupt_record_reads_and_sealing_keep_original(tmp_path, monkeypatch, d
         assert opened.read_bytes() == damaged
     else:
         packs.recover_open(opened)
-        assert opened.read_bytes() == original[:start]
+        if start:
+            assert opened.read_bytes() == original[:start]
+        else:
+            assert not opened.exists()
     state.db.close()
 
 
@@ -357,3 +361,77 @@ def test_b2_upload_checksums_and_abort(tmp_path, monkeypatch):
         with pytest.raises((ConnectionError, RuntimeError)):
             remote.put('key', path)
         assert remote.s3.aborted and not remote.s3.completed
+
+
+@pytest.mark.parametrize('seal_path', ['maintenance', 'direct'])
+def test_failed_seal_is_visible_and_independent_packs_continue_filesystem(tmp_path, seal_path):
+    from qmd2.ingestd import Ingestd
+    from qmd2.verify import evaluate
+
+    daemon = Ingestd(tmp_path, remote=False)
+    try:
+        packs = daemon.packs
+        bad = packs.append('raw', 'a-bad', {'id': 'bad'}, b'original')
+        packs.append('raw', 'z-good', {'id': 'good'}, b'original')
+        packs.sync()
+        path = packs.path('raw', 'a-bad', bad['seq'])
+        original = path.read_bytes()
+        path.write_bytes(original.replace(b'original', b'damaged!'))
+        daemon.state.db.execute('UPDATE packs SET created=?', (time.time() - SEAL_AGE - 60,))
+        daemon.state.commit()
+        daemon.publish_status()
+        status = json.loads((tmp_path / 'status.json').read_text())
+        assert 'seal:late' in evaluate(status, time.time())
+        if seal_path == 'maintenance':
+            packs.maintenance(max_uploads=0)
+        else:
+            with pytest.raises(ValueError):
+                packs.seal('raw', 'a-bad', bad['seq'])
+            good = next(row for row in daemon.state.packs() if row['source'] == 'z-good')
+            packs.seal('raw', 'z-good', good['seq'])
+        daemon.last_status = float('-inf')
+        daemon.publish_status()
+        status = json.loads((tmp_path / 'status.json').read_text())
+        checks = []
+        assert 'packs:seal' in evaluate(status, time.time(), checks)
+        assert 'a-bad' in next(c['reason'] for c in checks if c['name'] == 'packs:seal')
+        assert next(r for r in daemon.state.packs() if r['source'] == 'z-good')['sealed']
+        assert path.read_bytes() != original
+        path.write_bytes(original)
+        packs.maintenance(max_uploads=0)
+        daemon.last_status = float('-inf')
+        daemon.publish_status()
+        status = json.loads((tmp_path / 'status.json').read_text())
+        assert 'packs:seal' not in evaluate(status, time.time())
+    finally:
+        daemon.upload_pool.shutdown()
+        for stream in daemon.packs.files.values():
+            stream.close()
+        daemon.state.db.close()
+        daemon.lock.close()
+
+
+def test_recovered_empty_tail_does_not_block_sealing_filesystem(tmp_path):
+    state = State(tmp_path, True)
+    packs = Packs(state, writable=True)
+    empty = packs.path('raw', 'a-crashed', packs.allocate('raw', 'a-crashed'))
+    empty.write_bytes(b'{"len": 20')
+    state.commit()
+    packs = Packs(state, writable=True)
+    assert not empty.exists()
+    assert not state.packs()
+    good = packs.append('raw', 'z-good', {'id': 'synthetic'}, b'original')
+    packs.sync()
+    state.db.execute('UPDATE packs SET created=?', (time.time() - SEAL_AGE - 60,))
+    state.commit()
+    error = None
+    try:
+        packs.maintenance(max_uploads=0)
+    except (ValueError, OSError) as exc:
+        error = type(exc).__name__
+    rows = [dict(row) for row in state.packs()]
+    sealed = next(row['sealed'] for row in rows if row['source'] == good['source'])
+    for stream in packs.files.values():
+        stream.close()
+    state.db.close()
+    assert sealed, f'empty recovery raised {error}; later_pack_sealed={bool(sealed)}'

@@ -34,6 +34,32 @@ def test_status_contract_rejects_extra_key_when_closed(tmp_path):
         assert result.stdout == ('$.unexpected: unexpected\n' if extra else 'valid\n')
 
 
+def test_validator_numeric_boundaries_subprocess(tmp_path):
+    contract = tmp_path / 'number.json'
+    contract.write_text(json.dumps({'type': ['number', 'null'], 'minimum': 0}))
+    validator = Path(__file__).with_name('validate.py')
+    for literal, valid in (
+        ('0', True),
+        ('1.5', True),
+        ('1e308', True),
+        ('null', True),
+        ('true', False),
+        ('"12"', False),
+        ('-1', False),
+        ('1e309', False),
+        ('NaN', False),
+        ('Infinity', False),
+        ('-Infinity', False),
+    ):
+        result = subprocess.run(
+            [sys.executable, '-I', str(validator), str(contract)],
+            input=literal,
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == (0 if valid else 1), (literal, result.stdout)
+
+
 def test_currency_expiry_filesystem(tmp_path, monkeypatch):
     from qmd2.status import view
 

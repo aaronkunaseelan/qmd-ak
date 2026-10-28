@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "qmd.extract.v1",
   "title": "qmd extract --json",
-  "description": "Extract bytes from a path, stdin (-) or HTTP(S) URL: no archive, queue, state or index. URL input uses the shared link fetcher. Unknown fields are null.",
+  "description": "Extract bytes from a path, stdin (-) or HTTP(S) URL: no archive, queue, state or index. URL input uses the shared link fetcher. Unknown fields are null. Article metadata and fetch outcomes are optional v1 additions; producers emit them, older v1 payloads may omit them.",
   "x-owner": "qmd",
   "x-consumers": [
     "steward"
@@ -14,11 +14,7 @@
     "text",
     "model",
     "pages",
-    "error",
-    "title",
-    "author",
-    "published",
-    "fetched"
+    "error"
   ],
   "properties": {
     "schema": {

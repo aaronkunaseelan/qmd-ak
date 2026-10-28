@@ -89,6 +89,7 @@ def test_receipt_time_boundary(tmp_path):
         'source_head': '2026-10-13T14:00:00+02:00',
         'connection_head': '2026-10-13T12:00:00Z',
         'last_complete': '2026-10-13T12:00:00Z',
+        'fresh_through': 1791892800,
         'oldest_failed_at': None,
         'searchable_through': 1791892800,
         'captured_at': '2026-10-13T12:00:00Z',

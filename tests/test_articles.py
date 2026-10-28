@@ -57,11 +57,15 @@ def test_x_table(row, kind, failed):
     assert doc['id'] == doc['item'] == 'x:synthetic:42'
     assert bool(doc.get('parse_failed')) == failed
     assert doc['kind'] == kind
-    assert doc['parser'] == 'x@4'
+    assert doc['parser'] == 'x@6'
     if not failed:
         assert 'lighthouse' in render(doc)
         changed = dict(row, favorite_count=99, views=100)
-        assert version(doc)['hash'] == version(x(json.dumps(changed).encode(), CTX)[0])['hash']
+        updated = x(json.dumps(changed).encode(), CTX)[0]
+        assert not updated.get('parse_failed')
+        assert [p for p in doc['parts'] if p['kind'] == 'authored'] == [
+            p for p in updated['parts'] if p['kind'] == 'authored'
+        ]
 
 
 @pytest.mark.parametrize(
@@ -91,7 +95,33 @@ def test_instapaper_table(row, count, kind, failed):
             assert docs[0]['parts'] == [{'kind': 'boilerplate', 'text': 'Article text unavailable'}]
 
 
-@pytest.mark.parametrize('source,row', [('x', {'tweet': TWEET}), ('instapaper', SNAPSHOT)])
+@pytest.mark.parametrize(
+    'source,row',
+    [
+        (
+            'x',
+            {
+                'tweet': TWEET,
+                'x_context': {
+                    'posts': [
+                        {
+                            'tweet': {'id': '43', 'text': 'semaphore'},
+                            'authored': True,
+                            'role': 'Author reply',
+                        },
+                        {
+                            'tweet': {'id': '41', 'text': 'zebracrossing'},
+                            'authored': False,
+                            'role': 'Parent',
+                        },
+                    ],
+                    'notices': ['3-page cap hit'],
+                },
+            },
+        ),
+        ('instapaper', SNAPSHOT),
+    ],
+)
 def test_article_chain(tmp_path, source, row):
     import hashlib
 
@@ -133,6 +163,9 @@ def test_article_chain(tmp_path, source, row):
     assert '<p>' not in text and 'hidden' not in text
     assert daemon.packs.read(doc['raw'])[1] == raw
     if source == 'x':
+        assert daemon.index.search('semaphore')[0]['id'] == doc['id']
+        assert not daemon.index.search('zebracrossing')
+        assert 'zebracrossing' in text and '3-page cap hit' in text
         daemon.record(source, json.dumps({'bookmark': TWEET}).encode(), CTX)
     else:
         daemon.record(source, json.dumps({'bookmark': SNAPSHOT['bookmark']}).encode(), CTX)

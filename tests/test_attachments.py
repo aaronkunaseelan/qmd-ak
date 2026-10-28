@@ -48,6 +48,73 @@ def test_attachment_parser_table(raw, failed):
     assert bool(parse(raw, {'key': 'synthetic/att/0', 'time': 1})[0].get('parse_failed')) == failed
 
 
+@pytest.mark.parametrize('source', ['attachment', 'manual'])
+@pytest.mark.parametrize('kind', ['ocr', 'transcript'])
+@pytest.mark.parametrize('total', [2, 5, None])
+def test_extraction_output_reparse_chain(tmp_path, source, kind, total):
+    from qmd2.attachments import output_doc
+    from qmd2.doc import render
+    from qmd2.policy import text
+    from qmd2.reads import Reader
+
+    identifier = 'manual:synthetic' if source == 'manual' else 'gmail:synthetic:1/att/0'
+    parent = dict(id=identifier, source=source, group='files', time='2026-10-13')
+    row = dict(
+        id=identifier,
+        parent=parent,
+        ref={'source': source},
+        media_sha256='synthetic',
+        azure_pages=2,
+        total_pages=total,
+        pages_requested=2,
+        pipeline_revision=3,
+    )
+    current = output_doc(row, 'Lighthouse harbor', 'synthetic-model', kind)
+    legacy = dict(
+        current,
+        parser='attachment@1',
+        parts=[
+            {
+                'kind': 'header',
+                'text': f'Model: synthetic-model; pipeline revision: 3; Pages: 2 of {total}',
+            },
+            {'kind': 'header', 'text': 'User supplied heading'},
+            current['parts'][-1],
+        ],
+    )
+    raw = dumps(legacy).encode()
+    parsed = parse(raw, {'key': identifier})[0]
+    assert parsed['parser'] == 'attachment@2'
+    assert parsed['model'] == 'synthetic-model' and parsed['pipeline_revision'] == 3
+    assert parsed['pages'] == dict(covered=2, total=total, requested=2)
+    assert 'Model:' not in render(parsed) and 'pipeline revision:' not in text(parsed)
+    assert 'User supplied heading' in render(parsed)
+    assert ('Extracted 2 of' in render(parsed)) == (total != 2)
+    assert parse(dumps(parsed).encode(), {'key': identifier}) == [parsed]
+    assert parsed['parts'][-1] == current['parts'][-1]
+
+    daemon = Ingestd(tmp_path, remote=False)
+    try:
+        daemon.record(source, raw, {'key': identifier, 'time': '2026-10-13'}, [legacy])
+        daemon.commit()
+        while not daemon.reindex(source, seconds=60):
+            pass
+        reader = Reader(tmp_path)
+        try:
+            fetched = reader.get(parsed['id'])[0]
+            assert fetched['parts'] == parsed['parts']
+            assert fetched['pages'] == parsed['pages']
+            assert reader.packs.read(fetched['raw'])[1] == raw
+        finally:
+            reader.close()
+        assert 'Model:' not in daemon.index.search('Lighthouse')[0]['snippet']
+    finally:
+        daemon.upload_pool.shutdown()
+        daemon.index.writer.wait_merging_threads()
+        daemon.state.db.close()
+        daemon.lock.close()
+
+
 def test_ptt_queue_filesystem_boundaries(tmp_path):
     cutoff = int(date(CUTOFF).timestamp() * 1e9)
     parent = {
@@ -162,7 +229,7 @@ def test_link_spool_chain_and_worker_end_states(tmp_path):
         doc = get_docs(tmp_path, identifier)[0]
         assert doc['title'] == 'Synthetic lighthouse'
         assert daemon.index.search('lighthouse')[0]['id'] == identifier
-        assert '[map](https://example.test/)' in doc['parts'][1]['text']
+        assert '[map](https://example.test/)' in doc['parts'][0]['text']
         assert doc['pipeline_revision'] == PIPELINE_REVISION
         archived = [r for r in daemon.state.packs('raw')]
         originals = [

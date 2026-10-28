@@ -65,6 +65,7 @@ type Receipt struct {
 	ConnectionHead   time.Time      `json:"connection_head,omitempty"`
 	LowerFidelity    int            `json:"lower_fidelity,omitempty"`
 	UnknownFields    int            `json:"unknown_fields,omitempty"`
+	ContextSkipped   []string       `json:"context_skipped,omitempty"`
 }
 type checkpoint struct {
 	Version    int             `json:"v"`
@@ -80,6 +81,9 @@ type run struct {
 	source, account, spool, statePath, journal, history, device, legacy, objects, contextPath, aliasesFrom string
 	limit                                                                                                  int
 	pendingOnly                                                                                            bool
+	xID                                                                                                    string
+	xstate                                                                                                 *xCursor
+	xScheduledReceipt                                                                                      *Receipt
 	env                                                                                                    map[string]string
 	state                                                                                                  checkpoint
 	receipt                                                                                                Receipt
@@ -196,6 +200,9 @@ func (r *run) emitHash(key string, payload []byte, state ObservationState, head 
 }
 func (r *run) save() error {
 	r.state.Receipt = r.receipt
+	if r.xScheduledReceipt != nil {
+		r.state.Receipt = *r.xScheduledReceipt
+	}
 	b, e := json.Marshal(r.state)
 	if e == nil {
 		e = atomicWrite(r.statePath, b)
@@ -300,6 +307,7 @@ func Main(args []string) int {
 	account := fs.String("account", "", "asserted source account")
 	envFile := fs.String("env-file", "/etc/qmd-agent/qmd-agent.env", "existing credentials file")
 	username := fs.String("x-username", "", "X username for own posts")
+	xID := fs.String("x-id", "", "Refresh one X post and context, without polling lists")
 	journal := fs.String("journal", "", "read-only journal root")
 	history := fs.String("history", "", "local history object")
 	legacy := fs.String("legacy", "", "original read-only messages.db")
@@ -321,6 +329,11 @@ func Main(args []string) int {
 	started := time.Now()
 	r := &run{source: args[0], account: *account, spool: *spool, journal: *journal, history: *history, device: *device, legacy: *legacy, objects: *objects, contextPath: *contextPath, aliasesFrom: *aliasesFrom, limit: *limit, receipt: Receipt{Source: args[0], ExclusionReasons: map[string]int{}}, client: &http.Client{Timeout: 120 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}}
 	r.pendingOnly = *pendingOnly
+	r.xID = *xID
+	if r.xID != "" && (r.source != "x" || strings.Trim(r.xID, "0123456789") != "") {
+		fmt.Fprintln(os.Stderr, "invalid X post id")
+		return 2
+	}
 	e := r.loadAccount(*envFile)
 	if e == nil && *username != "" {
 		r.env["QMD_X_USERNAME"] = *username
@@ -336,6 +349,10 @@ func Main(args []string) int {
 	r.receipt.NewestID = r.state.NewestID
 	if r.receipt.NewestID == "" {
 		r.receipt.NewestID = r.state.Receipt.NewestID
+	}
+	if r.xID != "" {
+		previous := r.state.Receipt
+		r.xScheduledReceipt = &previous
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
 	defer cancel()

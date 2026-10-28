@@ -33,6 +33,7 @@ from .state import DEFAULT_HOME
 
 CUTOFF = '2026-10-13T23:06:38Z'
 PIPELINE_REVISION = 3
+PARSER_VERSION = 2
 # One initial try and one retry at least three minutes later.
 RETRY_SCHEDULE = (180,)
 REMOTE_REFUSALS = frozenset(
@@ -330,7 +331,7 @@ def outcome_record(row):
             group='files',
             kind='attachment_outcome',
             parts=[],
-            parser='attachment@1',
+            parser=f'attachment@{PARSER_VERSION}',
             time=meta['ended_at'],
             state=row['state'],
             reason=row.get('reason'),
@@ -490,7 +491,7 @@ def parse(raw, ctx):
         doc = json.loads(raw)
         if not isinstance(doc, dict) or not doc.get('id') or not isinstance(doc.get('parts'), list):
             raise ValueError()
-        return [doc]
+        return [parsed_output(doc)]
     except (ValueError, TypeError):
         return [
             dict(
@@ -500,7 +501,7 @@ def parse(raw, ctx):
                 group='files',
                 kind='binary',
                 time=ctx.get('time'),
-                parser='attachment@1',
+                parser=f'attachment@{PARSER_VERSION}',
                 parse_failed=True,
                 parts=[{'kind': 'binary', 'text': 'Unreadable attachment output'}],
             )
@@ -1166,6 +1167,26 @@ def attachment_title(row, kind):
     )
 
 
+def parsed_output(doc):
+    doc['parser'] = f'attachment@{PARSER_VERSION}'
+    doc['parts'] = [
+        part
+        for part in doc['parts']
+        if not (
+            part['kind'] == 'header'
+            and part['text'].startswith('Model: ')
+            and '; pipeline revision: ' in part['text']
+        )
+    ]
+    pages = doc.get('pages') or {}
+    covered, total = pages.get('covered'), pages.get('total')
+    if covered is not None and (total is None or covered < total):
+        coverage = {'kind': 'header', 'text': f"Extracted {covered} of {total or 'unknown'} pages"}
+        if coverage not in doc['parts']:
+            doc['parts'].insert(0, coverage)
+    return doc
+
+
 def output_doc(row, text, model, kind):
     parent = row['parent']
     identifier = row['id'] + (
@@ -1188,16 +1209,10 @@ def output_doc(row, text, model, kind):
         item=row['id'],
         kind=kind,
         title=title,
-        parser='attachment@1',
+        parser=f'attachment@{PARSER_VERSION}',
         pipeline_revision=row.get('pipeline_revision', PIPELINE_REVISION),
         model=model,
-        parts=[
-            {
-                'kind': 'header',
-                'text': f"Model: {model}; pipeline revision: {row.get('pipeline_revision', PIPELINE_REVISION)}",
-            },
-            {'kind': 'authored' if kind == 'transcript' else 'attachment_text', 'text': text},
-        ],
+        parts=[{'kind': 'authored' if kind == 'transcript' else 'attachment_text', 'text': text}],
         context={
             **parent.get('context', {}),
             'parent': parent['id'],
@@ -1211,9 +1226,6 @@ def output_doc(row, text, model, kind):
             total=row.get('total_pages'),
             requested=row.get('pages_requested'),
         )
-        doc['parts'][0]['text'] += (
-            f"; Pages: {row['azure_pages']} of {row.get('total_pages') or 'unknown'}"
-        )
     if row['ref']['source'] == 'link':
         doc['link'] = row['ref']['url']
         doc['title'] = row.get('metadata', {}).get('title') or title
@@ -1221,7 +1233,7 @@ def output_doc(row, text, model, kind):
         doc['meeting'] = row['meeting']
         doc['title'] = row['meeting'].get('title') or title
         doc['from'] = (row['meeting'].get('host') or {}).get('email', '')
-    return doc
+    return parsed_output(doc)
 
 
 def queue_path(home, identifier):

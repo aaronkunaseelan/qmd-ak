@@ -27,7 +27,7 @@ from .attachments import (
 from .b2 import B2
 from .doc import Exclusion, date, dumps, version, visible
 from .index import Index
-from .packs import Packs, room
+from .packs import Packs, payload_integrity, room
 from .sources import SOURCES, ARCHIVE_ONLY_SOURCES
 from .sources.files import Walker
 from .sources.sessions import (
@@ -134,6 +134,7 @@ class Ingestd:
         self.session_cleanup_done = False
         self.files = []
         self.fetches = {}
+        self.spool_errors = {}
         self.uploads = {}
         self.upload_pool = concurrent.futures.ThreadPoolExecutor(max_workers=2)
         self.stats = self.state.get('totals', {'docs': 0, 'records': 0, 'bytes': 0})
@@ -213,7 +214,7 @@ class Ingestd:
             'version': native,
         }
 
-    def record(self, source, raw, ctx, docs=None, capture=None, metadata=None):
+    def record(self, source, raw, ctx, docs=None, capture=None, metadata=None, expected=None):
         capture = capture if capture is not None else time.time_ns()
         persisted = self.checkpoint('ctx:' + source, {})
         if persisted is None:
@@ -239,7 +240,7 @@ class Ingestd:
                     persisted[key] = value
                     self.context_dirty.add(source)
         origin = self.packs.append(
-            'raw', source, self.raw_header(ctx, capture, metadata=metadata), raw
+            'raw', source, self.raw_header(ctx, capture, metadata=metadata), raw, expected=expected
         )
         if docs is None:
             parser = next((p for name, p, _, _, *rest in SOURCES if name == source), None)
@@ -347,9 +348,6 @@ class Ingestd:
                 self.reparse_seen.add(doc['id'])
             if not deferred and self.index.upsert(doc, pointer, refresh=refresh):
                 self.stats['docs'] += doc['kind'] != 'attachment_outcome'
-                sample_key = f"sample:{source}:{pointer['seq']}"
-                if not self.checkpoint(sample_key):
-                    self.queue_checkpoint(sample_key, doc['id'])
             if doc.get('parse_failed'):
                 failures = self.checkpoint('parse_failures:' + source, 0)
                 self.queue_checkpoint('parse_failures:' + source, failures + 1)
@@ -511,7 +509,9 @@ class Ingestd:
         for path in paths:
             try:
                 self.spool_file(path, seconds / max(1, len(paths)))
+                self.spool_errors.pop(str(path), None)
             except Exception as e:
+                self.spool_errors[str(path)] = type(e).__name__
                 print(f'spool: {path.parent.name}: {type(e).__name__}', file=sys.stderr, flush=True)
 
     def spool_file(self, path, seconds):
@@ -580,7 +580,7 @@ class Ingestd:
         header['version'] = ARCHIVE_ONLY_SOURCES.get(source, header['version'])
         header['labels'] = labels
         with payload.open('rb') as body:
-            origin = self.packs.append('raw', source, header, body)
+            origin = self.packs.append('raw', source, header, body, expected=entry)
         self.stats['records'] += 1
         self.stats['bytes'] += entry['bytes']
         return origin
@@ -596,6 +596,7 @@ class Ingestd:
                     'reset-history',
                 ),
                 body,
+                expected=entry,
             )
         return origin
 
@@ -620,9 +621,13 @@ class Ingestd:
                     source,
                     self.raw_header(dict(ctx, key=entry['key']), capture, 'session-import', labels),
                     body,
+                    expected=entry,
                 )
                 self.stats['records'] += 1
                 self.stats['bytes'] += entry['bytes']
+            else:
+                body.seek(0)
+                payload_integrity(body, entry)
             body.seek(progress.get('offset', start))
             while time.monotonic() < deadline:
                 pos = body.tell()
@@ -658,7 +663,9 @@ class Ingestd:
             'item_time': entry.get('item_time'),
             **labels,
         }
-        origin = self.record(source, raw, ctx, capture=capture, metadata={'spool': str(payload)})
+        origin = self.record(
+            source, raw, ctx, capture=capture, metadata={'spool': str(payload)}, expected=entry
+        )
         return origin
 
     def fetch(self):
@@ -787,6 +794,11 @@ class Ingestd:
                 'cold_sample_id': cold_id,
                 'free_bytes': shutil.disk_usage(self.home).free,
                 'backlog': backlog,
+                'spool_errors': dict(self.spool_errors),
+                'seal_errors': [
+                    dict(stream=stream, source=source, seq=seq, error=error)
+                    for (stream, source, seq), error in self.packs.seal_errors.items()
+                ],
                 'totals': self.stats,
                 'sources': sources,
                 'files_archive_bytes': self.state.get('files-archive-totals', {}),
@@ -853,15 +865,13 @@ class Ingestd:
             limit=1,
             order_by_field='time',
         ).hits
-        if hits:
-            row = visible.row(hits[0][1])
-            recovered = {
-                **indexed,
-                'newest_id': row['id'],
-            }
-            if recovered != indexed:
-                self.queue_checkpoint('indexed:' + source, recovered)
-            indexed = recovered
+        recovered = {
+            **indexed,
+            'newest_id': visible.row(hits[0][1])['id'] if hits else None,
+        }
+        if recovered != indexed:
+            self.queue_checkpoint('indexed:' + source, recovered)
+        indexed = recovered
         return {
             **receipt,
             'receipt': receipt,
@@ -893,6 +903,11 @@ class Ingestd:
             with path.open('rb') as f:
                 f.seek(cp['offset'])
                 line = f.readline()
+            if not line:
+                self.spool_errors.pop(str(path), None)
+                continue
+            if not line.endswith(b'\n'):
+                continue
             try:
                 entry = json.loads(line)
                 source = entry['source'].removeprefix('session-')
@@ -903,25 +918,39 @@ class Ingestd:
                         pending = date(entry['captured_at']).timestamp()
                     old = sources[source]['oldest_pending']
                     sources[source]['oldest_pending'] = min(old, pending) if old else pending
-            except (ValueError, KeyError):
-                pass
+            except (ValueError, KeyError, TypeError, AttributeError) as error:
+                self.spool_errors[str(path)] = type(error).__name__
 
     def status_cold_sample(self, visible):
+        def valid(candidate):
+            row = visible.lookup(candidate) if candidate else None
+            if not row:
+                return False
+            pointer = row['pointer']
+            return (
+                self.state.db.execute(
+                    'SELECT 1 FROM packs WHERE stream=? AND source=? AND seq=? AND uploaded=1',
+                    (pointer['stream'], pointer['source'], pointer['seq']),
+                ).fetchone()
+                is not None
+            )
+
         cold_id = self.state.get('cold_sample_id')
-        if not cold_id:
-            for pack in self.state.packs('doc'):
-                if pack['uploaded']:
-                    cold_id = self.state.get(f"sample:{pack['source']}:{pack['seq']}")
-                    if not cold_id:
-                        first = next(self.packs.iter_pack(pack), None)
-                        if first:
-                            candidate = json.loads(first[2])['id']
-                            row = visible.lookup(candidate)
-                            if row and row['pointer']['seq'] == pack['seq']:
-                                cold_id = candidate
-                    if cold_id:
-                        self.queue_checkpoint('cold_sample_id', cold_id)
-                        break
+        if valid(cold_id):
+            return cold_id
+        uploaded = {
+            (pack['source'], pack['seq']) for pack in self.state.packs('doc') if pack['uploaded']
+        }
+        cold_id = next(
+            (
+                row['id']
+                for source in sorted({source for source, _ in uploaded})
+                for row in visible.scan(source=source)
+                if (row['pointer']['source'], row['pointer']['seq']) in uploaded
+            ),
+            None,
+        )
+        self.queue_checkpoint('cold_sample_id', cold_id)
         return cold_id
 
     def upload(self):

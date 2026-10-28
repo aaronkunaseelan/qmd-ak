@@ -205,6 +205,17 @@ class Reader:
                         return
 
     def attachment_head(self, attachment, lines):
+        head = attachment.get('head')
+        if head is None:
+            head = self.attachment_head_data(attachment, lines)
+        out = [
+            f"  {attachment['id']} ({attachment.get('name', '')}, {attachment.get('type', '')}, {head['state']})"
+        ]
+        text = head['calendar_summary'] or head['text']
+        out.extend('    ' + line for line in text.splitlines())
+        return out
+
+    def attachment_head_data(self, attachment, lines):
         state = 'unmaterialised'
         try:
             docs = self.get(attachment['id'])
@@ -217,19 +228,17 @@ class Reader:
         )
         if calendar and not docs:
             docs = self.calendar_attachment(attachment)
-        out = [
-            f"  {attachment['id']} ({attachment.get('name', '')}, {attachment.get('type', '')}, {state})"
-        ]
+        head = dict(state=state, text='', calendar_summary=None)
         if attachment.get('type', '').startswith('image/'):
-            return out
+            return head
         text = '\n'.join(
             p.get('text', '') for d in docs for p in d.get('parts', []) if p['kind'] != 'header'
         )
         if docs and calendar:
-            out.append('    ' + calendar_line(text))
+            head['calendar_summary'] = calendar_line(text)
         elif text:
-            out.extend('    ' + line for line in text.splitlines()[:lines])
-        return out
+            head['text'] = '\n'.join(text.splitlines()[:lines])
+        return head
 
     def calendar_attachment(self, attachment):
         parent_id, _, position = attachment['id'].rpartition('/att/')

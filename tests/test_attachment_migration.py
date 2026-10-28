@@ -10,7 +10,7 @@ from qmd2.doc import dumps
 from qmd2.ingestd import Ingestd
 
 
-def legacy_rows(home, daemon, done=977, unavailable=36894, queued=7):
+def legacy_rows(home, daemon, done, unavailable, queued):
     root = home / 'attachments/queue'
     root.mkdir(parents=True)
     now = time.time()
@@ -118,10 +118,12 @@ def legacy_rows(home, daemon, done=977, unavailable=36894, queued=7):
 
 def test_attachment_history_migration_filesystem_tantivy(tmp_path):
     daemon = Ingestd(tmp_path, remote=False)
-    root = legacy_rows(tmp_path, daemon)
+    # Cross several 100-row batches while retaining every outcome shape.
+    done, unavailable, queued = 107, 294, 7
+    root = legacy_rows(tmp_path, daemon, done, unavailable, queued)
     daemon.attachment_outcomes(seconds=0.2)
     first = daemon.state.get('attachment-migration')
-    assert not first['complete'] and 0 < first['migrated'] < 37871
+    assert not first['complete'] and 0 < first['migrated'] < done + unavailable
     live = dict(
         id='synthetic:live',
         item='synthetic:live',
@@ -178,10 +180,10 @@ def test_attachment_history_migration_filesystem_tantivy(tmp_path):
     assert result['migration']['row_errors'] == 0 and not result['migration'].get('error')
     assert result['migration']['lost_outputs'] == 1
     assert (result['done'], result['unavailable'], result['failed'], result['queued']) == (
-        975,
-        36895,
+        done - 2,
+        unavailable + 1,
         2,
-        7,
+        queued,
     )
     restored = get_docs(tmp_path, 'gmail:synthetic:legacy-0/att/4')[0]
     assert restored['kind'] == 'text' and restored['pipeline_revision'] == 1
@@ -190,8 +192,8 @@ def test_attachment_history_migration_filesystem_tantivy(tmp_path):
     assert get_docs(tmp_path, 'gmail:synthetic:legacy-2/att/4')[0]['reason'] == 'parent_deleted'
     daemon.reindex('gmail')
     assert get_docs(tmp_path, restored['id'])[0]['kind'] == 'text'
-    assert result['azure_pages'] == 977
-    assert result['migration']['remaining'] == 0 and result['migration']['moved'] == 7
+    assert result['azure_pages'] == done
+    assert result['migration']['remaining'] == 0 and result['migration']['moved'] == queued
     assert not list(root.glob('*.json'))
     assert (
         get_docs(tmp_path, 'wa:synthetic:chat:3/att/0')[0]['context']['parent']
@@ -202,7 +204,7 @@ def test_attachment_history_migration_filesystem_tantivy(tmp_path):
     assert not any(r['kind'] == 'attachment_outcome' for r in daemon.index.browse(limit=100))
     assert daemon.index.search('zephyr')[0]['id'] == live['id']
     # A committed output with a surviving queued row is acknowledged without a fetch.
-    identifier = 'wa:synthetic:chat:1000/att/0'
+    identifier = f'wa:synthetic:chat:{done}/att/0'
     path = queue_path(tmp_path, identifier)
     row = dict(id=identifier, state='queued', pipeline_revision=2, ref=dict(source='invalid'))
     save(path, row)

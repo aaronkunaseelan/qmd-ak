@@ -23,6 +23,15 @@ qmd extract https://example.org/article --json
 
 `qmd` is the CLI name used here; the installer creates `qmd2`. See the alias setup below.
 
+`get --json` preserves its existing fields, including `text`, and adds
+`docs[].attachments[].head`: `{state, text, calendar_summary}`. Heads read only
+cached extraction (or a Gmail `.ics` summary), never materialise. `--attachments
+head:N` limits head text to N lines and renders the same head in `text`; without
+that option JSON includes all cached head text while plain text stays unchanged.
+Images retain their state but omit head text. Calendar summaries are null for
+other attachments; unmaterialised calendar bytes can still supply a summary.
+The existing `--max-chars` truncation continues to return `docs: null`.
+
 ## How it works
 
 ```text
