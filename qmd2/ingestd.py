@@ -27,7 +27,7 @@ from .attachments import (
 from .b2 import B2
 from .doc import Exclusion, date, dumps, version, visible
 from .index import Index
-from .packs import Packs, payload_integrity, room
+from .packs import MAINTENANCE_INTERVAL, Packs, payload_integrity, room
 from .sources import SOURCES, ARCHIVE_ONLY_SOURCES
 from .sources.files import Walker
 from .sources.sessions import (
@@ -1579,7 +1579,7 @@ class Ingestd:
         backlog = self.state.db.execute(
             'SELECT 1 FROM packs WHERE sealed=1 AND uploaded=0 LIMIT 1'
         ).fetchone()
-        if backlog or time.monotonic() - self.last_maintenance >= 300:
+        if backlog or time.monotonic() - self.last_maintenance >= MAINTENANCE_INTERVAL:
             try:
                 self.packs.maintenance(max_uploads=0, sync=False)
                 self.cleanup_spool()

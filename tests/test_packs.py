@@ -8,7 +8,7 @@ import uuid
 import pytest
 
 from qmd2.b2 import B2
-from qmd2.packs import Packs, SEAL_AGE
+from qmd2.packs import MAINTENANCE_INTERVAL, Packs, SEAL_AGE
 from qmd2.state import State
 
 
@@ -363,6 +363,36 @@ def test_b2_upload_checksums_and_abort(tmp_path, monkeypatch):
         assert remote.s3.aborted and not remote.s3.completed
 
 
+@pytest.mark.parametrize('overdue_s, late', [(60, False), (2 * MAINTENANCE_INTERVAL + 1, True)])
+def test_open_pack_sealing_allows_maintenance_grace_filesystem(tmp_path, overdue_s, late):
+    from qmd2.ingestd import Ingestd
+    from qmd2.verify import evaluate
+
+    daemon = Ingestd(tmp_path, remote=False)
+    try:
+        daemon.packs.append('raw', 'synthetic', {'id': 'synthetic'}, b'original')
+        daemon.packs.sync()
+        daemon.state.db.execute('UPDATE packs SET created=?', (time.time() - SEAL_AGE - overdue_s,))
+        daemon.state.commit()
+        daemon.publish_status()
+        status = json.loads((tmp_path / 'status.json').read_text())
+        assert len(status['backlog']) == 1
+        assert not status['backlog'][0]['sealed']
+        assert ('seal:late' in evaluate(status, time.time())) == late
+        daemon.packs.maintenance(max_uploads=0)
+        assert all(row['sealed'] for row in daemon.state.packs())
+        daemon.last_status = float('-inf')
+        daemon.publish_status()
+        status = json.loads((tmp_path / 'status.json').read_text())
+        assert 'seal:late' not in evaluate(status, time.time())
+    finally:
+        daemon.upload_pool.shutdown()
+        for stream in daemon.packs.files.values():
+            stream.close()
+        daemon.state.db.close()
+        daemon.lock.close()
+
+
 @pytest.mark.parametrize('seal_path', ['maintenance', 'direct'])
 def test_failed_seal_is_visible_and_independent_packs_continue_filesystem(tmp_path, seal_path):
     from qmd2.ingestd import Ingestd
@@ -377,7 +407,10 @@ def test_failed_seal_is_visible_and_independent_packs_continue_filesystem(tmp_pa
         path = packs.path('raw', 'a-bad', bad['seq'])
         original = path.read_bytes()
         path.write_bytes(original.replace(b'original', b'damaged!'))
-        daemon.state.db.execute('UPDATE packs SET created=?', (time.time() - SEAL_AGE - 60,))
+        daemon.state.db.execute(
+            'UPDATE packs SET created=?',
+            (time.time() - SEAL_AGE - 2 * MAINTENANCE_INTERVAL - 1,),
+        )
         daemon.state.commit()
         daemon.publish_status()
         status = json.loads((tmp_path / 'status.json').read_text())

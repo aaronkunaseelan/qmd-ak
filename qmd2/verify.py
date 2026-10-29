@@ -17,7 +17,7 @@ from .state import DEFAULT_HOME
 from .exits import EXIT_CODES
 from .sources import head_kind
 from .status import currency, lateness_limit
-from .packs import SEAL_AGE
+from .packs import MAINTENANCE_INTERVAL, SEAL_AGE
 
 
 REASONS = {
@@ -195,7 +195,10 @@ def evaluate(status, now, checks=None, observed=None):
     check(bool(status.get('spool_errors')), 'spool:blocked')
     check(bool(status.get('seal_errors')), 'packs:seal')
     check(
-        any(not r.get('sealed', False) and r['age_s'] > SEAL_AGE for r in status['backlog']),
+        any(
+            not r.get('sealed', False) and r['age_s'] > SEAL_AGE + 2 * MAINTENANCE_INTERVAL
+            for r in status['backlog']
+        ),
         'seal:late',
     )
     attachments = status.get('attachments')
