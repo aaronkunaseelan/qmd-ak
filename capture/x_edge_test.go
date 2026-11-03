@@ -69,8 +69,8 @@ func TestXListingSubprocess(t *testing.T) {
 	if err := call("changed"); err != nil || !r.receipt.HeadComplete || r.receipt.Written < 5 {
 		t.Fatalf("changed head must continue to known page: err=%v receipt=%+v", err, r.receipt)
 	}
-	if err := call("cap"); err == nil || !r.receipt.RateLimited || r.receipt.HeadComplete || r.receipt.RequestsSent != 26 {
-		t.Fatal("cap during head must be incomplete and limited")
+	if err := call("cap"); err == nil || r.receipt.RateLimited || r.receipt.HeadComplete || r.receipt.RequestsSent != 26 {
+		t.Fatal("cap during head must be incomplete, and our own cap is not a provider limit")
 	}
 	if err := call("limited"); err == nil || !r.receipt.RateLimited || r.receipt.HeadComplete {
 		t.Fatal("provider 429 must stop head")
@@ -79,8 +79,8 @@ func TestXListingSubprocess(t *testing.T) {
 		t.Fatal(err)
 	}
 	r.state.Cursor = json.RawMessage(`{"backfill":{"list":1,"cursor":"1","done":false}}`)
-	if err := call("tailcap"); err != nil || !r.receipt.HeadComplete || !r.receipt.RateLimited || r.receipt.Backfill.Cursor != "2" {
-		t.Fatal("backfill cap must retain completed head and cursor")
+	if err := call("tailcap"); err != nil || !r.receipt.HeadComplete || r.receipt.RateLimited || r.receipt.Backfill.Cursor != "2" {
+		t.Fatal("backfill cap must retain completed head and cursor, and leave the receipt fresh-eligible (F-129)")
 	}
 	r.state.Cursor = json.RawMessage(`{"list":0,"cursor":"","full_pass":true}`)
 	if err := call("normal"); err != nil || !r.receipt.Backfill.Done {

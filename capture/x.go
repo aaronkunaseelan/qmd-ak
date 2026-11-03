@@ -77,8 +77,9 @@ func runX(ctx context.Context, r *run) error {
 }
 
 func (r *run) birdCommand(ctx context.Context, binary, preload string, remaining *int, args ...string) ([]byte, error) {
+	// The allowance is our own budget, not a provider limit: it stops the call but never marks the receipt
+	// rate_limited, which blocks fresh_through (decisions.md "a provider error or incomplete head"; F-129).
 	if *remaining <= 0 {
-		r.receipt.RateLimited = true
 		return nil, errors.New("bird request allowance exhausted")
 	}
 	f, e := os.CreateTemp("", "qmd2-bird-*")
@@ -112,7 +113,6 @@ func (r *run) birdCommand(ctx context.Context, binary, preload string, remaining
 	}
 	if e != nil {
 		if *remaining == 0 {
-			r.receipt.RateLimited = true
 			return nil, errors.New("bird request allowance exhausted")
 		}
 		failure := birdFailure(stderr.String())
