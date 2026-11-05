@@ -29,7 +29,12 @@ if [[ -f "$build/capture/go.mod" ]]; then
     -o "$runtime/bin/wireproxy" ./cmd/wireproxy) {heavy_lock}>&-
   (cd "$build/capture" && GOPROXY=off go build -o "$runtime/bin/qmd2-fetch" ./cmd/qmd2-fetch) {heavy_lock}>&-
   if [[ -d "$build/capture/cmd/wa-meow" ]]; then
-    (cd "$build/capture" && GOPROXY=off go build -o "$runtime/bin/wa-meow" ./cmd/wa-meow) {heavy_lock}>&-
+    # Reproducible build, installed only when it differs: capture then restarts onto it (F-80).
+    (cd "$build/capture" && GOPROXY=off go build -trimpath -ldflags=-buildid= -o "$build/wa-meow" ./cmd/wa-meow) {heavy_lock}>&-
+    if ! cmp -s "$build/wa-meow" "$runtime/bin/wa-meow"; then
+      install -m 755 "$build/wa-meow" "$runtime/bin/wa-meow.new" && mv -f "$runtime/bin/wa-meow.new" "$runtime/bin/wa-meow"
+      wa_rebuilt=1
+    fi
   fi
   exec {heavy_lock}>&-
 fi
@@ -50,4 +55,16 @@ fi
 
 if [[ -f "$build/systemd/qmd2-attachments.service" ]]; then
   systemctl --user enable --now qmd2-attachments.service
+fi
+# A rebuilt wa-meow runs only after a restart, which reconnects the linked device (owner, X-66.1).
+if [[ -n "${wa_rebuilt:-}" ]] && systemctl --user is-enabled --quiet qmd-wa-meow.service 2>/dev/null; then
+  since=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  systemctl --user restart qmd-wa-meow.service
+  sleep 10
+  pid=$(systemctl --user show -p MainPID --value qmd-wa-meow.service)
+  if ! systemctl --user is-active --quiet qmd-wa-meow.service || [[ "$(readlink "/proc/$pid/exe")" != "$runtime/bin/wa-meow" ]]; then
+    echo "deploy: qmd-wa-meow is not running the new binary after its restart at $since" >&2
+    exit 5
+  fi
+  echo "deploy: qmd-wa-meow restarted at $since on the new binary; confirm an arrival: qmd status (whatsapp connection_head after $since)"
 fi
