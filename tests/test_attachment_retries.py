@@ -1,5 +1,7 @@
 """One refusal classifier and two tries through the real fetch/spool edges."""
 
+import errno
+import os
 import ssl
 import sys
 import urllib.error
@@ -8,6 +10,9 @@ import pytest
 
 from qmd2 import attachments
 from qmd2.ingestd import Ingestd
+
+# These errnos raise a subclass the classifier answers by class name first.
+HANDLED_BY_CLASS = {'ECONNRESET', 'ECONNREFUSED', 'ETIMEDOUT'}
 
 
 @pytest.mark.parametrize(
@@ -44,6 +49,34 @@ from qmd2.ingestd import Ingestd
 )
 def test_refusal_classifier_table(error, category, reason):
     assert attachments.temporary_refusal(error) == (category, reason)
+
+
+@pytest.mark.parametrize(
+    'error,category',
+    [
+        (OSError(getattr(errno, name), os.strerror(getattr(errno, name))), 'temporary')
+        for name in sorted(attachments.TRANSIENT_ERRNOS)
+        if name not in HANDLED_BY_CLASS
+    ]
+    + [
+        (OSError(number, os.strerror(number)), 'permanent')
+        for number in (errno.ENOENT, errno.EACCES, errno.EEXIST)
+    ],
+)
+def test_oserror_reason_names_the_errno(error, category):
+    name = errno.errorcode[error.errno]
+    assert attachments.temporary_refusal(error) == (
+        category,
+        f'{type(error).__name__} {name} ({os.strerror(error.errno)})',
+    )
+
+
+def test_oserror_reason_carries_no_path_or_message():
+    error = OSError(errno.ENOSPC, os.strerror(errno.ENOSPC), '/home/private/invoice.pdf')
+    assert attachments.temporary_refusal(error) == (
+        'temporary',
+        f'OSError ENOSPC ({os.strerror(errno.ENOSPC)})',
+    )
 
 
 @pytest.mark.parametrize('code', [429, 503])

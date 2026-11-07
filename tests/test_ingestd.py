@@ -243,6 +243,41 @@ def test_indexed_time_tantivy_high_water(tmp_path):
     close_daemon(daemon)
 
 
+def test_deleting_the_newest_doc_republishes_status(tmp_path):
+    from qmd2.ingestd import Ingestd
+
+    daemon = Ingestd(tmp_path, remote=False)
+    try:
+        for entry, stamp in [('new', '2026-10-13T12:00:00Z'), ('old', '2026-09-13T12:00:00Z')]:
+            raw = json.dumps(
+                {
+                    'type': 'message',
+                    'id': entry,
+                    'timestamp': stamp,
+                    'message': {'role': 'user', 'content': 'synthetic lighthouse'},
+                }
+            ).encode()
+            daemon.record('pi', raw, {'runtime': 'pi', 'session': 'synthetic', 'item_time': stamp})
+            daemon.commit()
+        assert (
+            json.loads((tmp_path / 'status.json').read_text())['sources']['pi']['newest_id']
+            == 'pi:synthetic#new'
+        )
+        # The gate is closed: only the delete of the published pointer may open it.
+        daemon.last_status = time.monotonic()
+        old = daemon.index.lookup('pi:synthetic#new')
+        daemon.documents('pi', [daemon.tombstone('pi', old)], old['version']['raw'], time.time_ns())
+        daemon.commit()
+        assert (
+            json.loads((tmp_path / 'status.json').read_text())['sources']['pi']['newest_id']
+            == 'pi:synthetic#old'
+        )
+        assert daemon.index.lookup('pi:synthetic#old')
+        assert daemon.index.lookup('pi:synthetic#new') is None
+    finally:
+        close_daemon(daemon)
+
+
 def test_fetch_receipt_filesystem_subprocess(tmp_path):
     import time
     from qmd2.ingestd import Ingestd
@@ -491,7 +526,7 @@ def test_filesystem_subprocess_tail_spool_and_cli(tmp_path):
     assert packs.read(doc['raw'])[1] == envelope
 
     from qmd2.ingestd import Ingestd
-    from qmd2.sources.sessions import ROOTS, context
+    from qmd2.sources.sessions import ROOTS, context, inventory
 
     original_roots = ROOTS[:]
     ROOTS[:] = [(runtime, tmp_path / root) for (runtime, _), root in zip(ROOTS, roots)]
@@ -599,6 +634,16 @@ def test_filesystem_subprocess_tail_spool_and_cli(tmp_path):
         for runtime in previous:
             receipt = daemon.status_receipt(runtime, time.time())
             assert receipt['ok'] is True and not receipt.get('error')
+        # A walk over unchanged files reads none and still counts every file.
+        daemon.last_walk -= 15
+        daemon.sessions()
+        daemon.commit()
+        files = inventory()[0]
+        for runtime in previous:
+            receipt = daemon.status_receipt(runtime, time.time())
+            assert receipt['written'] == 0 and receipt['failed'] == 0
+            assert receipt['enumerated'] == sum(r == runtime for r, _, _ in files)
+            assert receipt['unchanged'] + receipt['excluded'] == receipt['enumerated']
         daemon.reset_source('codex')
         reset = daemon.status_receipt('codex', time.time())
         assert reset['ok'] is False

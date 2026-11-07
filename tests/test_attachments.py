@@ -65,6 +65,7 @@ def test_extraction_output_reparse_chain(tmp_path, source, kind, total):
         ref={'source': source},
         media_sha256='synthetic',
         azure_pages=2,
+        pages_read=2,
         total_pages=total,
         pages_requested=2,
         pipeline_revision=3,
@@ -181,7 +182,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         pass
 
 
-def test_link_spool_chain_and_worker_end_states(tmp_path):
+def test_link_spool_chain_and_worker_end_states(tmp_path, loopback_allowed, open_guard_cli):
     server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), Handler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -195,17 +196,7 @@ def test_link_spool_chain_and_worker_end_states(tmp_path):
             fcntl.flock(lock, fcntl.LOCK_EX)
             assert not worker.cycle()
         inline = subprocess.run(
-            [
-                sys.executable,
-                '-m',
-                'qmd2.cli',
-                '--home',
-                str(tmp_path),
-                'get',
-                url,
-                '--materialise',
-                '--json',
-            ],
+            open_guard_cli + ['--home', str(tmp_path), 'get', url, '--materialise', '--json'],
             capture_output=True,
             check=True,
         )
@@ -337,7 +328,7 @@ def test_link_spool_chain_and_worker_end_states(tmp_path):
         parent = get_docs(tmp_path, parent['id'])[0]
         alias = parent['attachments'][0]['id']
         ceiling = dict(os.environ, QMD_UNTIL='2026-08-17T00:00:00Z')
-        cmd = [sys.executable, '-m', 'qmd2.cli', '--home', str(tmp_path)]
+        cmd = open_guard_cli + ['--home', str(tmp_path)]
         inline = subprocess.run(
             cmd + ['get', alias, '--materialise', '--json'], env=ceiling, capture_output=True
         )
@@ -416,6 +407,94 @@ def test_authenticated_whatsapp_media_subprocess_edge():
     ref['fileSHA256'] = encode(bytes(32))
     with pytest.raises(ValueError):
         decrypt(ref, encrypted)
+
+
+def test_whatsapp_video_media_decrypts_with_the_video_key_label():
+    """A video or video note (ptv) uses WhatsApp's 'Video Keys' label; an unknown type is refused by name."""
+    from qmd2.attachments import Unavailable
+
+    plaintext = b'Synthetic video original bytes'
+    key = bytes(range(32, 64))
+    prk = hmac.digest(bytes(32), key, 'sha256')
+    expanded, block = b'', b''
+    for i in range(1, 5):
+        block = hmac.digest(prk, block + b'WhatsApp Video Keys' + bytes([i]), 'sha256')
+        expanded += block
+    iv, aes, mac = expanded[:16], expanded[16:48], expanded[48:80]
+    cipher = run(
+        ['openssl', 'enc', '-aes-256-cbc', '-K', aes.hex(), '-iv', iv.hex()], data=plaintext
+    )
+    encrypted = cipher + hmac.digest(mac, iv + cipher, 'sha256')[:10]
+
+    def encode(body):
+        return base64.b64encode(body).decode()
+
+    for type_ in ('video', 'ptv'):
+        ref = dict(
+            type=type_,
+            mediaKey=encode(key),
+            fileLength=len(plaintext),
+            fileSHA256=encode(hashlib.sha256(plaintext).digest()),
+            fileEncSHA256=encode(hashlib.sha256(encrypted).digest()),
+        )
+        assert decrypt(ref, encrypted) == plaintext
+    ref['type'] = 'hologram'
+    with pytest.raises(Unavailable, match='unsupported_type'):
+        decrypt(ref, encrypted)
+
+
+def test_whatsapp_video_original_is_archived_not_type_routed(tmp_path, monkeypatch):
+    """fetch_media(original=True) writes a decrypted mp4 verbatim; extraction's typed path still refuses it."""
+    import io
+    from qmd2 import attachments as A
+
+    plaintext = b'\x00\x00\x00\x18ftypmp42' + bytes(range(256)) * 4
+    key = bytes(range(64, 96))
+    prk = hmac.digest(bytes(32), key, 'sha256')
+    expanded, block = b'', b''
+    for i in range(1, 5):
+        block = hmac.digest(prk, block + b'WhatsApp Video Keys' + bytes([i]), 'sha256')
+        expanded += block
+    iv, aes, mac = expanded[:16], expanded[16:48], expanded[48:80]
+    cipher = run(
+        ['openssl', 'enc', '-aes-256-cbc', '-K', aes.hex(), '-iv', iv.hex()], data=plaintext
+    )
+    encrypted = cipher + hmac.digest(mac, iv + cipher, 'sha256')[:10]
+
+    def encode(body):
+        return base64.b64encode(body).decode()
+
+    ref = dict(
+        source='whatsapp',
+        type='video',
+        directPath='/v/t62.7161-24/synthetic?ccb=11-4',
+        mediaKey=encode(key),
+        fileLength=len(plaintext),
+        fileSHA256=encode(hashlib.sha256(plaintext).digest()),
+        fileEncSHA256=encode(hashlib.sha256(encrypted).digest()),
+    )
+
+    class Answer(io.BytesIO):
+        headers = {}
+        status = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+    class Opener:
+        def open(self, *a, **k):
+            return Answer(encrypted)
+
+    monkeypatch.setattr(A, 'opener', lambda *a, **k: Opener())
+    target = tmp_path / 'video.bin'
+    A.fetch_media(tmp_path, dict(id='wa:x:y:z/att/0', ref=ref), target, original=True)
+    assert target.read_bytes() == plaintext
+    target.unlink()
+    with pytest.raises(A.Unavailable, match='unsupported_type'):
+        A.fetch_media(tmp_path, dict(id='wa:x:y:z/att/0', ref=ref), target)
 
 
 def test_terminal_alert_age_filesystem_edge(tmp_path):

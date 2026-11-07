@@ -40,12 +40,16 @@
         "null"
       ]
     },
+    "truncated": {
+      "type": "boolean",
+      "description": "True when --max-chars cut the text; absent means false."
+    },
     "pages": {
       "type": [
         "object",
         "null"
       ],
-      "description": "Page coverage from the shared extractor, or null for non-paged input.",
+      "description": "Page coverage from the shared extractor: covered is the pages the text covers, read locally or by Azure; null for non-paged input.",
       "required": [
         "covered",
         "total",

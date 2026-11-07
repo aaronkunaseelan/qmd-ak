@@ -4,31 +4,37 @@ import argparse
 import base64
 import codecs
 from concurrent.futures import ThreadPoolExecutor
+import errno
 import fcntl
 import hashlib
 import hmac
+import http.client
 import io
+import ipaddress
 import json
 import math
 import os
 import resource
 import re
 import shutil
+import socket
 import ssl
 import subprocess
 import sys
 import tempfile
 import time
 import urllib.error
+import unicodedata
 import urllib.parse
 import urllib.request
 import zipfile
+from datetime import datetime, timezone
 from email import policy
 from email.parser import BytesParser
 from pathlib import Path
 
 from .accounts import account
-from .doc import Exclusion, date, dumps, visible
+from .doc import Exclusion, ceiling, date, dumps, selected_pages, visible
 from .state import DEFAULT_HOME
 
 CUTOFF = '2026-10-13T23:06:38Z'
@@ -47,6 +53,12 @@ REMOTE_REFUSALS = frozenset(
     }
 )
 LIMIT = 50 * 1024 * 1024
+# WhatsApp media links expire, so bytes are fetched at arrival; one fetch stays bounded, and
+# the rescue verb pauses between fetches to stay polite.
+ARCHIVE_LIMIT = 100 * 1024**2
+RESCUE_PACE = 1.0
+# Names the one-time lane backfill: its presence says every archived record's locator is recorded.
+MEDIA_INDEX = 'media-index'
 CAPS = dict(
     audio=512 * 1024**2,
     pdf=100 * 1024**2,
@@ -67,6 +79,34 @@ SIGNATURES = (
     (b'PK\x03\x04', 'zip'),
 )
 TOOL = Path(account('transcriber_tool')).expanduser()
+# m3's Apple Vision OCR, the same client shape as m3-fetch's: {"url", "token"}. Absent means Azure only.
+OCR_CONFIG = Path.home() / '.config/m3-ocr/client.json'
+OCR_CONNECT_SECONDS = 5
+# The service bounds one document to ~15 s and holds a single slot, so a queue wait is the long tail.
+OCR_READ_SECONDS = 120
+# A PDF's own text layer is read locally and free; only a scan goes to OCR (D-181).
+PDFTOTEXT = '/usr/bin/pdftotext'
+PDFTOTEXT_TIMEOUT = 60
+PDFTOTEXT_VERSION = None
+# A fetched URL arrives in a message or a document, so it must never reach an internal service. is_global already
+# excludes loopback, RFC 1918, link-local, ULA and reserved space; the networks are named too so the rule reads
+# plainly and survives a change in the ipaddress module's tables. 100.64/10 and fd7a:115c:a1e0::/48 are the tailnet.
+BLOCKED_NETWORKS = [
+    ipaddress.ip_network(network)
+    for network in (
+        '0.0.0.0/8',
+        '10.0.0.0/8',
+        '100.64.0.0/10',
+        '127.0.0.0/8',
+        '169.254.0.0/16',
+        '172.16.0.0/12',
+        '192.168.0.0/16',
+        '::1/128',
+        'fc00::/7',
+        'fe80::/10',
+        'fd7a:115c:a1e0::/48',
+    )
+]
 
 
 class Unavailable(Exception):
@@ -119,12 +159,17 @@ def route(kind):
     )
 
 
+def extraction_type(kind):
+    """Refuse a kind extraction has no branch for: fetch, restore and extract share this one gate."""
+    if route(kind) not in CAPS:
+        raise Unavailable('unsupported_type')
+    return kind
+
+
 def stream(reader, target, encrypted=False):
     first = reader.read(4096)
-    kind = detect(first) if not encrypted else 'audio'
-    cap = CAPS.get(route(kind))
-    if cap is None:
-        raise Unavailable('unsupported_type')
+    kind = extraction_type(detect(first) if not encrypted else 'audio')
+    cap = CAPS[route(kind)]
     if shutil.disk_usage(target.parent).free < 8 * 1024**3 + 2 * cap:
         raise OSError('disk floor')
     size = 0
@@ -145,6 +190,21 @@ def stream(reader, target, encrypted=False):
             raise Unavailable('unsupported_type') from None
         return 'docx'
     return kind
+
+
+def stream_original(reader, target, encrypted=False):
+    """Copy original bytes with no type routing, capped at ARCHIVE_LIMIT as they are read."""
+    cap = ARCHIVE_LIMIT + (32 if encrypted else 0)
+    if shutil.disk_usage(target.parent).free < 8 * 1024**3 + 2 * cap:
+        raise OSError('disk floor')
+    size = 0
+    with target.open('wb') as output:
+        while chunk := reader.read(1024**2):
+            size += len(chunk)
+            if size > cap:
+                raise Unavailable('too_large')
+            output.write(chunk)
+    return target
 
 
 def save(path, value):
@@ -185,23 +245,41 @@ def queued_row(path):
         return None
 
 
-def enqueue(home, identifier, parent, ref, automatic=False, captured_at=None, backfill=False):
+def enqueue(
+    home,
+    identifier,
+    parent,
+    ref,
+    automatic=False,
+    captured_at=None,
+    backfill=False,
+    media_only=False,
+    retry_failed=False,
+):
     root = Path(home) / 'attachments/pending'
     root.mkdir(parents=True, exist_ok=True, mode=0o700)
     path = queue_path(home, identifier)
+    queued = queued_row(path)
     stored = stored_outcome(home, identifier, output=False)
+    # rescue retries what qmd itself broke (state failed); a source refusal (unavailable) stands.
+    retry = retry_failed and (stored or queued or {}).get('state') == 'failed'
     redo_fetch = (
         stored
         and ref['source'] in ('x', 'link')
         and stored.get('reason') == 'media_expired'
         and not stored.get('browser_fetch')
     )
-    if stored and (
-        not backfill or (stored['pipeline_revision'] >= PIPELINE_REVISION and not redo_fetch)
+    if (
+        stored
+        and (not backfill or (stored['pipeline_revision'] >= PIPELINE_REVISION and not redo_fetch))
+        and not retry
     ):
         return stored['state']
-    if row := queued_row(path):
-        return row['state']
+    if queued and not retry:
+        return queued['state']
+    if queued:
+        # A retry replaces the failed queue row it read; publish_queue never overwrites one.
+        remove_queue(path)
     row = dict(
         id=identifier,
         parent={
@@ -223,6 +301,7 @@ def enqueue(home, identifier, parent, ref, automatic=False, captured_at=None, ba
         ref=ref,
         automatic=automatic,
         backfill=backfill,
+        media_only=media_only,
         enqueued_at=time.time(),
         captured_at=time.time() if captured_at is None else captured_at,
         attempts=0,
@@ -277,19 +356,25 @@ def enqueue_auto(home, raw, docs, capture, automatic=True):
         if doc.get('parse_failed'):
             continue
         for pos, ref in enumerate(media_refs(source, raw)):
-            if not (
-                source == 'whatsapp'
-                and ref.get('type') in ('audio', 'image')
-                and ref.get('mimetype') != 'image/gif'
-                or source == 'x'
-                and ref.get('type') == 'photo'
-            ):
-                continue
             identifier = f"{doc['id']}/att/{pos}"
+            extracts = (source == 'whatsapp' and ref.get('type') in ('audio', 'image')) or (
+                source == 'x' and ref.get('type') == 'photo'
+            )
+            extracts = extracts and ref.get('mimetype') != 'image/gif'
+            # WhatsApp links expire, so every arriving attachment is fetched; only these extract.
+            if not extracts and not (source == 'whatsapp' and automatic):
+                continue
             if source == 'x':
                 ref = dict(ref, url=ref.get('media_url_https') or ref.get('url'))
             enqueue(
-                home, identifier, doc, dict(ref, source=source), automatic, captured, not automatic
+                home,
+                identifier,
+                doc,
+                dict(ref, source=source),
+                automatic,
+                captured,
+                not automatic,
+                media_only=not extracts,
             )
             identifiers.append(identifier)
     return identifiers
@@ -313,6 +398,9 @@ def outcome_record(row):
             'browser_fetch',
             'fetched',
             'azure_pages',
+            'pages_read',
+            'vision',
+            'text_layer',
             'audio_seconds',
             'retry_of',
         )
@@ -616,7 +704,11 @@ def media_keys(media):
         'image': b'WhatsApp Image Keys',
         'document': b'WhatsApp Document Keys',
         'sticker': b'WhatsApp Image Keys',
-    }[media['type']]
+        'video': b'WhatsApp Video Keys',
+        'ptv': b'WhatsApp Video Keys',  # a round video note
+    }.get(media['type'])
+    if info is None:
+        raise Unavailable('unsupported_type')
     key = b64(media['mediaKey'])
     if len(key) != 32:
         raise ValueError('media key invalid')
@@ -628,7 +720,8 @@ def media_keys(media):
     return iv, aes, mac
 
 
-def decrypt(media, encrypted, target=None):
+def decrypt(media, encrypted, target=None, copy=None):
+    """Verify and decrypt WhatsApp media; `copy` writes the plaintext (default: extraction's typed `stream`)."""
     source = io.BytesIO(encrypted) if isinstance(encrypted, bytes) else encrypted.open('rb')
     with source:
         source.seek(0, 2)
@@ -666,7 +759,7 @@ def decrypt(media, encrypted, target=None):
                     preexec_fn=limits,
                 ) as child:
                     try:
-                        stream(child.stdout, target)
+                        (copy or stream)(child.stdout, target)
                     finally:
                         child.stdout.close()
                     if child.wait(timeout=120):
@@ -696,6 +789,116 @@ def raw_parent(home, parent):
             return packs.read(parent['raw'])[1]
     finally:
         state.db.close()
+
+
+NAT64 = ipaddress.ip_network('64:ff9b::/96')
+V4_COMPATIBLE = ipaddress.ip_network('::/96')
+
+
+def address_allowed(address):
+    """Public and not multicast; an IPv4-mapped IPv6 address is judged as the IPv4 one it carries."""
+    ip = ipaddress.ip_address(address.split('%', 1)[0])
+    if ip.version == 6:
+        # An IPv6 form that carries an IPv4 address is judged as that address: mapped (::ffff:a.b.c.d),
+        # NAT64 (64:ff9b::/96, reaches a.b.c.d through a DNS64 gateway) and the old compatible form (::a.b.c.d).
+        embedded = ip.ipv4_mapped
+        if embedded is None and (ip in NAT64 or ip in V4_COMPATIBLE):
+            embedded = ipaddress.IPv4Address(int(ip) & 0xFFFFFFFF)
+        ip = embedded or ip
+    return (
+        ip.is_global
+        and not ip.is_multicast
+        and not any(
+            ip in network for network in BLOCKED_NETWORKS if network.version == ip.version
+        )
+    )
+
+
+def checked_addresses(host, port):
+    """The addresses one name resolves to, every one public; a refusal never names the host."""
+    infos = socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)
+    if not infos or not all(address_allowed(info[4][0]) for info in infos):
+        raise Unavailable('blocked_address')
+    return infos
+
+
+def guarded_connect(address, timeout=None, source_address=None):
+    """socket.create_connection, but the address that was checked is the one connected to (no second lookup)."""
+    error = None
+    for family, kind, proto, _, sockaddr in checked_addresses(*address):
+        sock = socket.socket(family, kind, proto)
+        try:
+            if timeout is not socket._GLOBAL_DEFAULT_TIMEOUT:  # http.client's 'no timeout given'
+                sock.settimeout(timeout)
+            if source_address:
+                sock.bind(source_address)
+            sock.connect(sockaddr)
+            return sock
+        except OSError as failure:
+            sock.close()
+            error = failure
+    raise error or ConnectionRefusedError('connect failed')
+
+
+def guarded_connection(factory):
+    def open_(host, **kwargs):
+        connection = factory(host, **kwargs)
+        connection._create_connection = guarded_connect
+        return connection
+
+    return open_
+
+
+class GuardedHandlers(urllib.request.HTTPHandler, urllib.request.HTTPSHandler):
+    """http and https on connections whose connect() refuses a non-public answer."""
+
+    def http_open(self, req):
+        return self.do_open(guarded_connection(http.client.HTTPConnection), req)
+
+    def https_open(self, req):
+        return self.do_open(guarded_connection(http.client.HTTPSConnection), req)
+
+
+class CheckedRedirects(urllib.request.HTTPRedirectHandler):
+    """Each hop is checked by name, so a relay's own resolver cannot aim the next request inward."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        following = super().redirect_request(req, fp, code, msg, headers, newurl)
+        if following is not None:
+            check_url(following.full_url)
+        return following
+
+
+def check_url(url):
+    """An http(s) URL whose name resolves to public addresses only."""
+    parts = urllib.parse.urlsplit(url)
+    if parts.scheme.lower() not in ('http', 'https'):
+        raise Unavailable('blocked_scheme')
+    try:
+        port = parts.port or (443 if parts.scheme.lower() == 'https' else 80)
+    except ValueError:
+        raise Unavailable('blocked_address') from None
+    if not parts.hostname:
+        raise Unavailable('blocked_address')
+    try:
+        return checked_addresses(parts.hostname, port)
+    except OSError as error:  # classified as the connect failure it stands for
+        raise urllib.error.URLError(error) from None
+
+
+def opener(relay=None):
+    """One attempt's connections: no proxy, public addresses only, and every redirect hop checked again.
+
+    A relay is a SOCKS handler, which resolves the name at the exit, so the name is what gets checked there.
+    """
+    handlers = [urllib.request.ProxyHandler({}), CheckedRedirects()]
+    if relay is None:
+        handlers.append(GuardedHandlers())
+    else:
+        from . import mullvad
+
+        handlers.append(mullvad.SocksHandler(relay))
+    return urllib.request.build_opener(*handlers)
 
 
 def normalized_url(url):
@@ -764,11 +967,22 @@ def materialise(home, identifier, pages=None, parent=None):
     if '/att/' not in identifier:
         get_docs(home, identifier)
         raise LookupError()
+    parent, _, ref = attachment_ref(home, identifier)
+    return identifier, enqueue(home, identifier, parent, dict(ref, pages=pages))
+
+
+def attachment_ref(home, identifier, parent=None):
+    """The parent document, its attachment reference and the fetch ref for one attachment id."""
+    from .cli import get_docs
+
     parent_id, position = identifier.rsplit('/att/', 1)
-    parent = get_docs(home, parent_id)[0]
+    parent = parent or get_docs(home, parent_id)[0]
     attachment = next((a for a in parent.get('attachments', []) if a['id'] == identifier), None)
     if not attachment:
         raise LookupError()
+    if attachment.get('type') == 'text/uri-list':
+        # A link entry is a URL the parent mentions, not bytes to fetch: only media has a fetch ref.
+        raise Unavailable('not_media')
     source = parent['source']
     if source == 'whatsapp':
         ref = json.loads(raw_parent(home, parent))['decoded']['media'][int(position)]
@@ -781,7 +995,7 @@ def materialise(home, identifier, pages=None, parent=None):
         )
     else:
         raise Unavailable('unsupported_source')
-    return identifier, enqueue(home, identifier, parent, dict(ref, source=source, pages=pages))
+    return parent, attachment, dict(ref, source=source, size=attachment.get('size'))
 
 
 def link_parent(home, url):
@@ -808,8 +1022,9 @@ def link_parent(home, url):
         reader.close()
 
 
-def fetch_url(row, target, open_=None, relay=None, started=None):
+def fetch_url(row, target, open_=None, relay=None, started=None, original=False):
     started = time.monotonic() if started is None else started
+    copy = stream_original if original else stream
     via = 'mullvad' if relay else 'direct'
     attempt = dict(via=via, relay=relay, status=None, error=None, elapsed_s=0)
     attempts = row.get('fetched', {}).get('attempts', [])
@@ -818,11 +1033,12 @@ def fetch_url(row, target, open_=None, relay=None, started=None):
     row['fetched'] = dict(via=via, status=None, final_url=url, attempts=attempts)
     try:
         req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
-        open_ = open_ or urllib.request.build_opener(urllib.request.ProxyHandler({})).open
+        check_url(url)
+        open_ = open_ or opener().open
         with open_(req, timeout=60) as response:
             attempt['status'] = response.status
             row['fetched'].update(status=response.status, final_url=response.geturl())
-            stream(response, target)
+            copy(response, target)
     except Exception as error:
         if isinstance(error, urllib.error.HTTPError):
             attempt['status'] = error.code
@@ -834,7 +1050,9 @@ def fetch_url(row, target, open_=None, relay=None, started=None):
     return target
 
 
-def fetch_media(home, row, target):
+def fetch_media(home, row, target, original=False):
+    """Fetch one attachment's bytes; original copies verbatim for archive, else extraction routes by type."""
+    copy = stream_original if original else stream
     ref = row['ref']
     if ref['source'] == 'whatsapp':
         path = ref.get('directPath', '')
@@ -854,9 +1072,9 @@ def fetch_media(home, row, target):
         )
         encrypted = target.with_suffix('.encrypted')
         try:
-            with urllib.request.urlopen(request_, timeout=60) as response:
-                stream(response, encrypted, encrypted=True)
-            decrypt(ref, encrypted, target)
+            with opener().open(request_, timeout=60) as response:
+                copy(response, encrypted, encrypted=True)
+            decrypt(ref, encrypted, target, copy)
         finally:
             encrypted.unlink(missing_ok=True)
     elif ref['source'] == 'gmail':
@@ -864,22 +1082,22 @@ def fetch_media(home, row, target):
         encoded = raw['raw']
         mime = base64.urlsafe_b64decode(encoded + '=' * (-len(encoded) % 4))
         part = list(BytesParser(policy=policy.default).parsebytes(mime).walk())[ref['position']]
-        stream(io.BytesIO(part.get_payload(decode=True) or b''), target)
+        copy(io.BytesIO(part.get_payload(decode=True) or b''), target)
     elif ref['source'] in ('x', 'link'):
         row['browser_fetch'] = True
-        fetch_url(row, target)
+        fetch_url(row, target, original=original)
     elif ref['source'] == 'manual':
         with Path(ref['path']).open('rb') as source:
-            stream(source, target)
+            copy(source, target)
     else:
         raise Unavailable('unsupported_source')
     return target
 
 
-def fetch(home, row, target):
+def fetch(home, row, target, original=False):
     try:
         try:
-            return fetch_media(home, row, target)
+            return fetch_media(home, row, target, original)
         except Exception as error:
             category, _ = temporary_refusal(error)
             if row['ref']['source'] not in ('x', 'link') or category not in (
@@ -896,8 +1114,9 @@ def fetch(home, row, target):
             attempts = row['fetched']['attempts']
             before = len(attempts)
             try:
-                with mullvad.tunnel(relay, secret) as open_:
-                    return fetch_url(row, target, open_, relay['hostname'], started)
+                with mullvad.tunnel(relay, secret) as proxy:
+                    open_ = opener(proxy).open
+                    return fetch_url(row, target, open_, relay['hostname'], started, original)
             except Exception as error:
                 category, reason = temporary_refusal(error)
                 if isinstance(error, Unavailable) and reason.startswith('shared_key_relay_'):
@@ -985,30 +1204,171 @@ def audio_slices(path, step=lambda message: None):
             yield index * 600, duration, sliced
 
 
+def transcriber_release(tool=None):
+    """The tg-tools release that ran the transcriber: `current` names releases/<sha>, no git read."""
+    return Path(tool or TOOL).resolve().parents[1].name
+
+
 def transcribe(path):
-    output = run(
-        [sys.executable, str(TOOL), str(path), '--raw', '--model', 'mini', '--jobs', '1'],
-        timeout=360,
-        azure=True,
-    )
+    """Transcribe one audio file and label the engine that ran: provider:model+release.
+
+    The transcriber reads its own credentials and reports the engine it used as JSON: a self-hosted
+    run names model and engine build (parakeet-ultra@fluidaudio-...), an Azure fallback says azure.
+    """
+    handle, engine = tempfile.mkstemp(prefix='transcribe-engine-', suffix='.json')
+    os.close(handle)
+    try:
+        output = run(
+            [
+                sys.executable,
+                str(TOOL),
+                str(path),
+                '--raw',
+                '--model',
+                'mini',
+                '--jobs',
+                '1',
+                '--engine-file',
+                engine,
+            ],
+            timeout=360,
+            azure=True,
+        )
+        try:
+            reported = json.loads(Path(engine).read_text())
+            label = f'{reported["provider"]}:{reported["model"]}'
+        except (OSError, ValueError, KeyError, TypeError):
+            raise OSError('engine label missing') from None
+    finally:
+        Path(engine).unlink(missing_ok=True)
     text = output.decode().strip()
     if not text:
         raise OSError('empty transcription')
-    revision = run(['git', '-C', str(TOOL.parent), 'rev-parse', 'HEAD']).decode().strip()
-    settings = {}
-    for p in (
-        TOOL.with_name('.env'),
-        Path(account('transcription_env')).expanduser(),
-        Path.home() / '.config/agent-secrets/azure-openai-transcription.env',
-    ):
-        for key, value in env_file(p).items():
-            settings.setdefault(key, value)
-    deployment = settings.get('TRANSCRIBE_AUDIO_MODEL_MINI') or settings.get(
-        'AZURE_OPENAI_TRANSCRIPTION_MINI_DEPLOYMENT'
+    return text, label + '+' + transcriber_release()
+
+
+def vision_ocr(path):
+    """Apple Vision on m3 reads one document: (text, engine, pages), or (None, the reason, None).
+
+    The endpoint is the operator's own tailnet service, reached like Azure's, through no URL guard. An image
+    Vision reads as empty is ('', engine, 1): its answer, not a reason for Azure to read it again.
+    """
+    try:
+        config = json.loads(OCR_CONFIG.read_text())
+        url, token = config['url'].rstrip('/'), config['token']
+        parts = urllib.parse.urlsplit(url)
+        if not parts.hostname or not isinstance(token, str) or not token:
+            raise ValueError()
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        return None, 'no_config', None
+    boundary = 'qmd2vision'
+    name = path.name.replace('"', '')
+    head = (
+        f'--{boundary}\r\nContent-Disposition: form-data; name="file"; filename="{name}"\r\n'
+        'Content-Type: application/octet-stream\r\n\r\n'
+    ).encode()
+    body = head + path.read_bytes() + f'\r\n--{boundary}--\r\n'.encode()
+    connection_type = (
+        http.client.HTTPSConnection if parts.scheme == 'https' else http.client.HTTPConnection
     )
-    if not deployment:
-        raise OSError('deployment label missing')
-    return text, deployment + '@' + revision
+    connection = connection_type(parts.hostname, parts.port, timeout=OCR_CONNECT_SECONDS)
+    try:
+        connection.connect()
+        connection.sock.settimeout(OCR_READ_SECONDS)
+        connection.request(
+            'POST',
+            parts.path + '/v1/ocr',
+            body=body,
+            headers={
+                'Authorization': 'Bearer ' + token,
+                'Content-Type': 'multipart/form-data; boundary=' + boundary,
+            },
+        )
+        response = connection.getresponse()
+        answer = json.loads(response.read(LIMIT + 1)) if response.status == 200 else {}
+    except TimeoutError:
+        return None, 'timeout', None
+    except (OSError, http.client.HTTPException):
+        # A broken answer (BadStatusLine, IncompleteRead) is the endpoint being unreachable, not a crash.
+        return None, 'unreachable', None
+    except ValueError:
+        return None, 'bad_answer', None
+    finally:
+        connection.close()
+    if response.status != 200:
+        return None, f'http_{response.status}', None
+    scripts = [page.get('script') or {} for page in answer.get('pages') or []]
+    # Vision has no Greek model: Greek arrives as Cyrillic look-alikes, so a Latin-free Cyrillic page means it
+    # guessed the wrong script and Azure reads the image instead.
+    if any(s.get('greek', 1) == 0 and s.get('cyrillic', 0) > 0.05 for s in scripts):
+        return None, 'script_cyrillic', None
+    text = '\n\n'.join(page.get('text') or '' for page in answer.get('pages') or [])
+    if not answer.get('engine'):
+        return None, 'no_text', None
+    # An empty read is Vision's answer, not a reason for Azure: ('', engine) labels the row and extract()'s
+    # 3-word check raises Unavailable('no_text'), as for any image it cannot read.
+    return text, answer['engine'], len(answer.get('pages') or [])
+
+
+def pdftotext_version():
+    """The tool's own version, read once: `pdftotext -v` prints it to stderr and exits 0."""
+    global PDFTOTEXT_VERSION
+    if PDFTOTEXT_VERSION is None:
+        try:
+            printed = subprocess.run([PDFTOTEXT, '-v'], capture_output=True, text=True, timeout=10)
+            found = re.search(r'pdftotext version (\S+)', printed.stdout + printed.stderr)
+            PDFTOTEXT_VERSION = found[1] if found else 'unknown'
+        except (OSError, subprocess.SubprocessError):
+            PDFTOTEXT_VERSION = 'unknown'
+    return PDFTOTEXT_VERSION
+
+
+def text_quality(text, pages):
+    """The measured rule (26/26 PDFs on the test corpus): why a text layer is unreadable, or None.
+
+    A scan has no text layer or a garbage one: too few characters per page, not letters, control or
+    replacement characters, or words that are not words.
+    """
+    if not pages:
+        return 'no pages'
+    chars = len(text)
+    per_page = chars / pages
+    if per_page < 100:
+        return f'chars/page {per_page:.0f} < 100'
+    spaced = [c for c in text if not c.isspace()]
+    share = sum(c.isalnum() for c in spaced) / max(1, len(spaced))
+    if share < 0.70:
+        return f'alnum share {share:.2f} < 0.70'
+    control = sum(unicodedata.category(c) in ('Cc', 'Co', 'Cn') and c not in '\n\r\t' for c in text)
+    if control / chars > 0.01 or '\ufffd' in text or '\ue000' in text:
+        return 'control/replacement chars'
+    words = re.findall(r'[^\W\d_]{2,}', text)
+    mean = sum(len(w) for w in words) / max(1, len(words))
+    if not 2.0 <= mean <= 14:
+        return f'mean word length {mean:.1f}'
+    return None
+
+
+def text_layer(path, pages, total_pages):
+    """A PDF's own text when it passes the rule: (text, None), else (None, why the page needs OCR).
+
+    A pdftotext failure or timeout is a failed check, not a failed row: its reason goes to the row
+    and the page goes to Vision. A page selection becomes pdftotext's own -f/-l span.
+    """
+    argv = [PDFTOTEXT, '-q']
+    if pages:
+        first, last = pages.split('-')
+        argv += ['-f', first, '-l', last]
+    try:
+        text = run(argv + [str(path), '-'], timeout=PDFTOTEXT_TIMEOUT).decode('utf-8', 'replace')
+    except TimeoutError:
+        return None, 'pdftotext_timeout'
+    except OSError:
+        return None, 'pdftotext_failed'
+    if pages:
+        pages = selected_pages(pages)
+    reason = text_quality(text, pages or total_pages)
+    return (text, None) if reason is None else (None, reason)
 
 
 def azure_di(path, model, pages=None):
@@ -1033,7 +1393,7 @@ def azure_di(path, model, pages=None):
         + ':analyze?api-version=2024-11-30'
     )
     if pages is not None:
-        url += '&' + urllib.parse.urlencode({'pages': f'1-{pages}'})
+        url += '&' + urllib.parse.urlencode({'pages': pages})
     try:
         _, response = request(url, path.read_bytes(), headers)
         operation = response['Operation-Location']
@@ -1071,7 +1431,7 @@ def azure_di(path, model, pages=None):
 
 def extract(row, path, step=lambda message: None):
     with path.open('rb') as source:
-        kind = route(detect(source.read(4096)))
+        kind = route(extraction_type(detect(source.read(4096))))
     if kind == 'audio':
         pieces = []
         for offset, row['audio_seconds'], sliced in audio_slices(path, step):
@@ -1087,13 +1447,39 @@ def extract(row, path, step=lambda message: None):
         kind = 'docx'
     if kind in ('pdf', 'image', 'docx'):
         pages = row['ref'].get('pages') if kind in ('pdf', 'docx') else None
+        # A selection is an A-B span; a queued ref may hold a page count instead.
+        pages = f'1-{pages}' if isinstance(pages, int) else pages
         row['total_pages'] = page_count(path, kind)
-        text, model, row['azure_pages'] = azure_di(
-            path, 'prebuilt-layout' if kind in ('pdf', 'docx') else 'prebuilt-read', pages
-        )
-        if pages is None:
-            row['total_pages'] = row['azure_pages']
-        row['pages_requested'] = pages
+        text = model = None
+        if kind == 'pdf':
+            text, reason = text_layer(path, pages, row['total_pages'])
+            row['text_layer'] = reason or 'ok'
+            if text is not None:
+                model = 'pdftotext@' + pdftotext_version()
+                row['azure_pages'] = 0
+                row['pages_read'] = selected_pages(pages) if pages else row['total_pages']
+        if text is None:
+            # m3-ocr reads a PDF whole, so a page span stays on Azure's layout, which honours it.
+            read = (None, None, None)
+            if kind in ('pdf', 'image'):
+                read = (None, 'pages_selected', None)
+                if kind == 'image' or not pages:
+                    read = vision_ocr(path)
+            if read[0] is not None:
+                text, model, row['pages_read'] = read
+                row['azure_pages'] = 0
+                # m3 reads the whole document (an image is one page) and answers how many it read.
+                row['total_pages'] = row['pages_read']
+            else:
+                if read[1] is not None:
+                    row['vision'] = read[1]
+                text, model, row['azure_pages'] = azure_di(
+                    path, 'prebuilt-layout' if kind in ('pdf', 'docx') else 'prebuilt-read', pages
+                )
+                if pages is None:
+                    row['total_pages'] = row['azure_pages']
+                row['pages_read'] = row['azure_pages']
+        row['pages_requested'] = selected_pages(pages) if pages else None
         row['model'] = model
         if len(re.findall(r'[^\W\d_]{3,}', text)) < 3:
             raise Unavailable('no_text')
@@ -1220,9 +1606,9 @@ def output_doc(row, text, model, kind):
         },
         media_sha256=row['media_sha256'],
     )
-    if 'azure_pages' in row:
+    if 'pages_read' in row:
         doc['pages'] = dict(
-            covered=row['azure_pages'],
+            covered=row['pages_read'],
             total=row.get('total_pages'),
             requested=row.get('pages_requested'),
         )
@@ -1250,14 +1636,200 @@ def lock_path(path):
     return root / (path.stem + '.lock')
 
 
+def attachment_identifier(identifier):
+    """The attachment an id names, or None: an extracted output id names its own document."""
+    if re.fullmatch(r'manual:[0-9a-f]{64}', identifier):
+        return identifier
+    return identifier if re.fullmatch(r'.*/att/\d+', identifier) else None
+
+
+def lane_locators(home, identifier=None):
+    """Archived attachment ids and their raw locators, newest lane pack first; one id stops at its match."""
+    from .b2 import B2
+    from .packs import Packs
+    from .state import State
+
+    if not (Path(home) / 'state.sqlite').exists():
+        return {}
+    state = State(home)
+    packs = Packs(state)
+    found = {}
+    try:
+        lanes = sorted(
+            (p for p in state.packs('raw') if p['source'] in ('attachment', 'manual')),
+            key=lambda p: -p['seq'],
+        )
+        for pack in lanes:
+            for attempt in (0, 1):
+                try:
+                    for loc, head, _ in packs.iter_pack(pack):
+                        if head.get('kind') == 'archive-only' and head.get('id'):
+                            found.setdefault(head['id'], loc)
+                            if identifier == head['id']:
+                                return found
+                    break
+                except FileNotFoundError:
+                    if attempt:
+                        raise
+                    packs.b2 = B2()
+    finally:
+        state.db.close()
+    return found
+
+
+def archived_locator(home, identifier):
+    """Raw locator recorded when this attachment's original bytes were archived, or None."""
+    from .state import State
+
+    if not (Path(home) / 'state.sqlite').exists():
+        return None
+    state = State(home)
+    try:
+        return state.get('media:' + identifier)
+    finally:
+        state.db.close()
+
+
+def checkpoint_ids(home):
+    """Every attachment id whose original bytes are archived, from the checkpoints alone."""
+    from .state import State
+
+    if not (Path(home) / 'state.sqlite').exists():
+        return set()
+    state = State(home)
+    try:
+        return {
+            key.removeprefix('media:')
+            for (key,) in state.db.execute("SELECT key FROM checkpoints WHERE key LIKE 'media:%'")
+        }
+    finally:
+        state.db.close()
+
+
+def record_locator(home, identifier, loc):
+    """Record an archived attachment's locator, so no later read has to walk the lanes."""
+    from .state import State
+
+    state = State(home, writable=True)
+    try:
+        state.set('media:' + identifier, loc)
+        state.commit()
+    finally:
+        state.db.close()
+
+
+def parent_document(home, identifier):
+    """The parent document of an attachment id: hidden or unknown under a ceiling is a refusal."""
+    from .reads import Reader
+
+    if not (Path(home) / 'index').exists():
+        return None
+    parent_id = identifier.rsplit('/att/', 1)[0]
+    reader = Reader(home)
+    try:
+        row = reader.index.lookup(parent_id) or next(iter(reader.index.item(parent_id)), None)
+        if row is None:
+            if ceiling():
+                raise LookupError()
+            return None
+        return reader.read(row)
+    finally:
+        reader.close()
+
+
+def too_large(ref):
+    """A declared size over the cap refuses early; the read itself is capped by stream_original."""
+    return int(ref.get('fileLength') or 0) > ARCHIVE_LIMIT
+
+
+def raw_bytes(home, loc, target):
+    """Write one archived record's bytes, from a local pack or cold from B2."""
+    from .b2 import B2
+    from .packs import Packs
+    from .state import State
+
+    state = State(home)
+    packs = Packs(state)
+    try:
+        try:
+            packs.write_raw(loc, target)
+        except FileNotFoundError:
+            packs.b2 = B2()
+            packs.write_raw(loc, target)
+    finally:
+        state.db.close()
+
+
+def media_source(home, identifier, step=lambda message: None):
+    """An attachment's original bytes: its recorded locator, else a fetched temp file spooled for archive."""
+    identifier = attachment_identifier(identifier)
+    manual = identifier.startswith('manual:')
+    # A manual id is its own document, so the ceiling applies to its bytes like any other id's.
+    parent = parent_document(home, identifier)
+    loc = archived_locator(home, identifier)
+    if loc:
+        return loc
+    if manual:
+        return None
+    listed = parent is not None and any(
+        a['id'] == identifier for a in parent.get('attachments', [])
+    )
+    if parent is not None and not listed:
+        raise LookupError()
+    # Only a read may walk the lanes: for an id its parent lists, and only before the backfill has run.
+    if listed and backfill_pending(home):
+        loc = lane_locators(home, identifier).get(identifier)
+        if loc:
+            record_locator(home, identifier, loc)
+            return loc
+    parent, _, ref = attachment_ref(home, identifier, parent)
+    if too_large(ref):
+        raise Unavailable('too_large')
+    root = Path(home) / 'attachments/media'
+    root.mkdir(parents=True, exist_ok=True, mode=0o700)
+    target = Path(tempfile.mkstemp(dir=root)[1])
+    try:
+        step('fetch')
+        fetch(home, dict(id=identifier, parent=parent, ref=ref), target, original=True)
+        step('archive')
+        spool(home, identifier, target, True)
+    except Exception:
+        target.unlink(missing_ok=True)
+        raise
+    return target
+
+
+def archive_media(home, row, media, step):
+    """Fetch and archive one attachment's original bytes only; extraction stays on demand."""
+    if archived_locator(home, row['id']):
+        row['state'] = 'archived'
+        return
+    if too_large(row['ref']):
+        raise Unavailable('too_large')
+    step('fetch')
+    fetch(home, row, media, original=True)
+    step('archive')
+    spool(home, row['id'], media, True)
+    row['state'] = 'archived'
+
+
 def extract_media(home, row, media, path, step):
     if not row.get('media_path'):
-        step('fetch')
-        fetch(home, row, media)
+        loc = archived_locator(home, row['id'])
+        if loc:
+            step('restore')
+            with media.open('wb') as target:
+                raw_bytes(home, loc, target)
+            # An archived original may be of any type: refuse one extraction has no branch for.
+            with media.open('rb') as source:
+                extraction_type(detect(source.read(4096)))
+        else:
+            step('fetch')
+            fetch(home, row, media)
         with media.open('rb') as source:
             row['media_sha256'] = hashlib.file_digest(source, 'sha256').hexdigest()
-        step('archive')
-        if row['ref']['source'] != 'manual':
+        if not loc and row['ref']['source'] != 'manual':
+            step('archive')
             spool(home, row['id'], media, True)
         row.update(media_path=str(media.relative_to(home)), fetched_at=time.time())
         save(path, row)
@@ -1276,6 +1848,24 @@ def extract_media(home, row, media, path, step):
 
 def remote_refusal(reason):
     return (reason or '').split(' (', 1)[0] in REMOTE_REFUSALS
+
+
+# Errnos worth another attempt; everything else keeps the failure permanent.
+TRANSIENT_ERRNOS = frozenset(
+    name
+    for name in (
+        'EAGAIN',
+        'EINTR',
+        'ETIMEDOUT',
+        'ECONNRESET',
+        'ECONNREFUSED',
+        'EHOSTUNREACH',
+        'ENETUNREACH',
+        'ENOSPC',
+        'EIO',
+    )
+    if hasattr(errno, name)
+)
 
 
 def temporary_refusal(error):
@@ -1301,6 +1891,11 @@ def temporary_refusal(error):
     ):
         if isinstance(error, type_):
             return 'temporary', f'remote_unavailable ({reason})'
+    if isinstance(error, OSError) and error.errno is not None:
+        name = errno.errorcode.get(error.errno, f'errno {error.errno}')
+        short = error.strerror or os.strerror(error.errno)
+        kind = 'temporary' if name in TRANSIENT_ERRNOS else 'permanent'
+        return kind, f'{type(error).__name__} {name} ({short})'
     return 'permanent', type(error).__name__
 
 
@@ -1343,16 +1938,19 @@ def process(home, row, step=lambda message: None, block=True):
             row.pop('next_attempt_at', None)
             row['pipeline_revision'] = max(PIPELINE_REVISION, row.get('pipeline_revision', 0))
             save(path, row)
-            doc, model = extract_media(home, row, media, path, step)
-            row.update(
-                pipeline_revision=doc['pipeline_revision'],
-                state='done',
-                ended_at=time.time(),
-                output_id=doc['id'],
-                model=model,
-                output=doc,
-            )
-            row.pop('reason', None)
+            if row.get('media_only'):
+                archive_media(home, row, media, step)
+            else:
+                doc, model = extract_media(home, row, media, path, step)
+                row.update(
+                    pipeline_revision=doc['pipeline_revision'],
+                    state='done',
+                    ended_at=time.time(),
+                    output_id=doc['id'],
+                    model=model,
+                    output=doc,
+                )
+                row.pop('reason', None)
         except Exception as error:
             category, row['reason'] = temporary_refusal(error)
             if category == 'temporary':
@@ -1369,6 +1967,11 @@ def process(home, row, step=lambda message: None, block=True):
             if row['state'] != 'queued':
                 row['ended_at'] = time.time()
         if row['state'] != 'queued':
+            if row['state'] == 'archived':
+                media.unlink(missing_ok=True)
+                remove_queue(path)
+                step('archived')
+                return row
             doc = outcome_record(row)
             if row['state'] == 'done':
                 row['output'] = doc
@@ -1393,6 +1996,10 @@ def demand(home, identifier, step, pages=None):
     if stored and not queue_path(home, identifier).exists():
         step(stored['state'])
         return stored
+    path = queue_path(home, identifier)
+    if (queued := queued_row(path)) and queued.get('media_only'):
+        # An explicit materialise extracts; the archived bytes are its input.
+        save(path, dict(queued, media_only=False, state='queued'))
     row = finish(home, {'id': identifier}, step)
     if row['state'] == 'done' and 'output' not in row:
         from .cli import get_docs
@@ -1532,6 +2139,132 @@ def backfill(home, source):
                 ),
             )
     return dict(source=source, total=len(rows), wall_s=time.time() - started)
+
+
+def backfill_pending(home):
+    """Whether archive lanes hold records whose locators were never recorded (the backfill has not run)."""
+    from .state import State
+
+    if not (Path(home) / 'state.sqlite').exists():
+        return False
+    state = State(home)
+    try:
+        lanes = any(p['source'] in ('attachment', 'manual') for p in state.packs('raw'))
+        return lanes and state.get(MEDIA_INDEX) is None
+    finally:
+        state.db.close()
+
+
+def index_locators(home, dry_run=False):
+    """One-time operator verb: record the archived lane records' locators by one walk of both lanes."""
+    from .packs import Packs
+    from .state import State
+
+    home = Path(home)
+    known = checkpoint_ids(home)
+    state = State(home)
+    packs = Packs(state)
+    try:
+        lanes = [p for p in state.packs('raw') if p['source'] in ('attachment', 'manual')]
+        local = sum(
+            1
+            for p in lanes
+            if packs.path('raw', p['source'], p['seq'], bool(p['sealed'])).exists()
+        )
+    finally:
+        state.db.close()
+    started = time.time()
+    found = lane_locators(home)
+    missing = {identifier: loc for identifier, loc in found.items() if identifier not in known}
+    written = 0
+    if not dry_run:
+        state = State(home, writable=True)
+        try:
+            for identifier, loc in missing.items():
+                state.set('media:' + identifier, loc)
+                written += 1
+                if not written % 200:
+                    state.commit()
+            state.set(MEDIA_INDEX, dict(records=len(found), at=time.time()))
+            state.commit()
+        finally:
+            state.db.close()
+    return dict(
+        dry_run=dry_run,
+        records=len(found),
+        known=len(known),
+        written=len(missing) if dry_run else written,
+        packs=len(lanes),
+        local=local,
+        b2=len(lanes) - local,
+        bytes=sum(p['size'] or 0 for p in lanes),
+        wall_s=round(time.time() - started, 1),
+    )
+
+
+def rescue(home, days=45, dry_run=False, step=lambda message: None):
+    """Archive the original bytes of WhatsApp media captured in the last N days, oldest first.
+
+    Link entries are skipped (not media), and an outcome qmd itself failed is tried again, while a
+    refusal the source gave (unavailable) stands.
+    """
+    from .reads import Reader
+
+    home = Path(home)
+    since = datetime.fromtimestamp(time.time() - days * 86400, timezone.utc).isoformat()
+    reader = Reader(home)
+    try:
+        parents = sorted(
+            reader.scan('whatsapp', since=since), key=lambda doc: (date(doc['time']), doc['id'])
+        )
+    finally:
+        reader.close()
+    archived = checkpoint_ids(home)
+    unarchived = [
+        attachment
+        for parent in parents
+        for attachment in parent.get('attachments', [])
+        if attachment['id'] not in archived
+    ]
+    # A parent's link entries are URLs it mentions, not media: they have no bytes to archive.
+    pending = [a['id'] for a in unarchived if a.get('type') != 'text/uri-list']
+    started = time.time()
+    result = dict(
+        days=days,
+        dry_run=dry_run,
+        archived_index=len(archived),
+        total=len(pending),
+        skipped=len(unarchived) - len(pending),
+        archived=0,
+        unavailable={},
+        failed={},
+        queued=0,
+    )
+    if backfill_pending(home):
+        # Without recorded locators every already-archived attachment would be fetched again.
+        result['reason'] = 'run attachments index once: no archived-locator index in this store yet'
+        return result
+    for identifier in pending if not dry_run else []:
+        try:
+            if shutil.disk_usage(home).free < 8 * 1024**3:
+                raise OSError('disk floor')
+            parent, _, ref = attachment_ref(home, identifier)
+            enqueue(home, identifier, parent, ref, media_only=True, retry_failed=True)
+            row = finish(home, {'id': identifier}, step) or {}
+        except Exception as error:
+            # One bad item never ends the run: it is counted with its reason, and the counts add up.
+            row = dict(state='failed', reason=temporary_refusal(error)[1])
+        state, reason = row.get('state'), row.get('reason', 'unknown')
+        if state == 'archived':
+            result['archived'] += 1
+        elif state in ('failed', 'unavailable'):
+            counts = result['failed' if state == 'failed' else 'unavailable']
+            counts[reason] = counts.get(reason, 0) + 1
+        else:
+            result['queued'] += 1
+        time.sleep(RESCUE_PACE)
+    result['wall_s'] = round(time.time() - started, 1)
+    return result
 
 
 class Worker:

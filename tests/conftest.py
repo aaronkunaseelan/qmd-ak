@@ -5,6 +5,7 @@ import http.server
 import json
 import os
 import shutil
+import sys
 import threading
 from pathlib import Path
 
@@ -12,11 +13,29 @@ import pytest
 
 os.environ['QMD2_ACCOUNTS'] = str(Path(__file__).with_name('accounts.json'))
 
-from qmd2 import mullvad
+from qmd2 import attachments, mullvad
+
+OPEN_GUARD = (
+    'import sys, qmd2.attachments as attachments; '
+    'attachments.address_allowed = lambda address: True; '
+    'from qmd2.cli import main; sys.exit(main())'
+)
 
 
 @pytest.fixture
-def exits(tmp_path, monkeypatch):
+def loopback_allowed(monkeypatch):
+    """A test whose target is this machine's own HTTP server opens the address guard for its run only."""
+    monkeypatch.setattr(attachments, 'address_allowed', lambda address: True)
+
+
+@pytest.fixture
+def open_guard_cli():
+    """A CLI command prefix whose guard's one decision is replaced before main() starts."""
+    return [sys.executable, '-c', OPEN_GUARD]
+
+
+@pytest.fixture
+def exits(tmp_path, monkeypatch, loopback_allowed):
     key = base64.b64encode(bytes(32)).decode()
     config = tmp_path / 'vpn.env'
     config.write_text(f'WIREGUARD_PRIVATE_KEY={key}\nWIREGUARD_ADDRESSES=10.0.0.2/32\n')

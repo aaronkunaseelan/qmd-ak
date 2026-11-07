@@ -128,6 +128,7 @@ class Ingestd:
         self.context_hashes = {}
         self.last_commit = time.monotonic()
         self.last_status = float('-inf')
+        self.published_newest = {}
         self.publish_on_commit = True
         self.last_maintenance = 0
         self.last_walk = 0
@@ -270,6 +271,7 @@ class Ingestd:
         ids = {item}
         ids.update(id for id, _ in self.index.searcher.terms_with_prefix('id', item + '/att/'))
         ids.update(id for id in self.index.pending if id.startswith(item + '/att/'))
+        self.unpublish_if_newest(source, ids)
         for id in ids:
             old = self.index.lookup(id)
             current = self.index.pending.get(id) or (old['version'] if old else None)
@@ -321,6 +323,12 @@ class Ingestd:
             indexed['processed_through'] = stamp
             self.queue_checkpoint('indexed:' + source, indexed)
 
+    def unpublish_if_newest(self, source, ids):
+        # A published newest_id points into the index; the delete that removes it must not hold
+        # the status gate, or status.json names a dead doc for up to STATUS_INTERVAL.
+        if self.published_newest.get(source) in ids:
+            self.last_status = float('-inf')
+
     def documents(
         self, source, docs, origin, capture, refresh=False, reparse=False, item_time=None
     ):
@@ -340,6 +348,8 @@ class Ingestd:
             self.processed(source, outcome_time)
             if source == 'files' and doc['kind'] == 'tombstone':
                 continue
+            if doc['kind'] == 'tombstone':
+                self.unpublish_if_newest(source, {doc['id']})
             self.reindex_doc_id = doc['id']
             pointer = self.append_doc(source, doc, origin, capture, reparse=refresh or reparse)
             deferred = self.visible_index is not None
@@ -388,48 +398,48 @@ class Ingestd:
             operation = 'session stat'
             try:
                 st = path.stat()
-                operation = 'session read'
-                ctx = {**context(path, source), **cp.get('ctx', {})}
-                off = cp.get('offset', 0)
-                if cp.get('inode') != st.st_ino or st.st_size < off:
-                    ctx, off = context(path, source), 0
-                if st.st_size > off:
-                    with path.open('rb') as f:
-                        f.seek(off)
-                        for raw, before, docs, after in lines(f, ctx, 4 * 1024 * 1024):
-                            if not excluded(before.get('project')):
-                                self.record(source, raw, before, docs)
-                            cp = {'inode': st.st_ino, 'offset': after['offset'], 'ctx': after}
-                            self.queue_checkpoint(key, cp)
-                            if time.monotonic() - self.last_commit >= 10:
-                                self.commit()
-                            if time.monotonic() >= deadline:
-                                break
-                    if not excluded(cp.get('ctx', ctx).get('project')):
-                        self.walk_counts[source]['written'] += int(cp.get('offset', off) > off)
-                    if (
-                        cp.get('offset', off) < st.st_size
-                        and st.st_size > cp.get('offset', off) + 1
-                    ):
-                        # Partial final lines wait for another pass; a bounded slice continues next turn.
+                if cp.get('inode') == st.st_ino and cp.get('offset') == st.st_size:
+                    # Most files are unchanged since their checkpoint: count them without reading.
+                    self.unchanged_session(source, path, cp, st)
+                else:
+                    operation = 'session read'
+                    ctx = {**context(path, source), **cp.get('ctx', {})}
+                    off = cp.get('offset', 0)
+                    if cp.get('inode') != st.st_ino or st.st_size < off:
+                        ctx, off = context(path, source), 0
+                    if st.st_size > off:
                         with path.open('rb') as f:
-                            f.seek(cp.get('offset', off))
-                            if f.readline().endswith(b'\n'):
+                            f.seek(off)
+                            for raw, before, docs, after in lines(f, ctx, 4 * 1024 * 1024):
+                                if not excluded(before.get('project')):
+                                    self.record(source, raw, before, docs)
+                                cp = {'inode': st.st_ino, 'offset': after['offset'], 'ctx': after}
+                                self.queue_checkpoint(key, cp)
+                                if time.monotonic() - self.last_commit >= 10:
+                                    self.commit()
                                 if time.monotonic() >= deadline:
-                                    return
-                                continue
-                elif not excluded(ctx.get('project')):
-                    self.walk_counts[source]['unchanged'] += 1
-                ctx.update(cp.get('ctx', {}))
-                if excluded(ctx.get('project')):
-                    item = f"{source}:{ctx['session']}"
-                    if ctx.get('agent'):
-                        item += ':' + ctx['agent']
-                    self.excluded_sessions.add((source, item))
-                    self.walk_counts[source]['excluded'] += 1
-                self.walk_counts[source]['enumerated'] += 1
-                if cp.get('offset', off) >= st.st_size:
-                    self.processed(source, st.st_mtime)
+                                    break
+                        if not excluded(cp.get('ctx', ctx).get('project')):
+                            self.walk_counts[source]['written'] += int(cp.get('offset', off) > off)
+                        if (
+                            cp.get('offset', off) < st.st_size
+                            and st.st_size > cp.get('offset', off) + 1
+                        ):
+                            # Partial final lines wait for another pass; a bounded slice continues next turn.
+                            with path.open('rb') as f:
+                                f.seek(cp.get('offset', off))
+                                if f.readline().endswith(b'\n'):
+                                    if time.monotonic() >= deadline:
+                                        return
+                                    continue
+                    elif not excluded(ctx.get('project')):
+                        self.walk_counts[source]['unchanged'] += 1
+                    ctx.update(cp.get('ctx', {}))
+                    if excluded(ctx.get('project')):
+                        self.exclude_session(source, ctx)
+                    self.walk_counts[source]['enumerated'] += 1
+                    if cp.get('offset', off) >= st.st_size:
+                        self.processed(source, st.st_mtime)
             except OSError as error:
                 self.walk_counts[source]['enumerated'] += 1
                 self.walk_counts[source]['failed'] += 1
@@ -439,6 +449,22 @@ class Ingestd:
                 self.position = 0
                 self.finish_session_walk()
                 return
+
+    def unchanged_session(self, source, path, cp, st):
+        ctx = {**context(path, source), **cp.get('ctx', {})}
+        if excluded(ctx.get('project')):
+            self.exclude_session(source, ctx)
+        else:
+            self.walk_counts[source]['unchanged'] += 1
+        self.walk_counts[source]['enumerated'] += 1
+        self.processed(source, st.st_mtime)
+
+    def exclude_session(self, source, ctx):
+        item = f"{source}:{ctx['session']}"
+        if ctx.get('agent'):
+            item += ':' + ctx['agent']
+        self.excluded_sessions.add((source, item))
+        self.walk_counts[source]['excluded'] += 1
 
     def start_session_walk(self, now):
         self.files, failed = inventory()
@@ -581,6 +607,8 @@ class Ingestd:
         header['labels'] = labels
         with payload.open('rb') as body:
             origin = self.packs.append('raw', source, header, body, expected=entry)
+        # The archived original bytes answer to the attachment id, like any other raw read.
+        self.queue_checkpoint('media:' + entry['key'], origin)
         self.stats['records'] += 1
         self.stats['bytes'] += entry['bytes']
         return origin
@@ -760,6 +788,9 @@ class Ingestd:
         visible = self.visible_index or self.index
         for source, _, _, cadence, *_ in SOURCES:
             sources[source] = self.source_status(source, cadence, visible, now)
+        self.published_newest = {
+            source: row['newest_id'] for source, row in sources.items() if row['newest_id']
+        }
         self.status_pending(sources)
         # A sealed file's mtime is its seal time; open packs age from creation.
         backlog = [

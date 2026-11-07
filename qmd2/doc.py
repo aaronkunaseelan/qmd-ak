@@ -1,8 +1,10 @@
 """K2 docs: written once, ordered by source clock, rendered whole."""
 
+import argparse
 import hashlib
 import json
 import os
+import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from html.parser import HTMLParser
@@ -30,6 +32,30 @@ def date(value):
         return strict_date(value)
     except (ValueError, TypeError, OverflowError):
         return datetime(1970, 1, 1, tzinfo=timezone.utc)
+
+
+PAGES = re.compile(r'([0-9]+)(?:-([0-9]+))?')
+
+
+def page_selection(value):
+    """`--pages` for get and extract: N reads the first N pages, A-B reads that span."""
+    match = PAGES.fullmatch(value.strip())
+    first, last = (int(match[1]), int(match[2] or match[1])) if match else (0, 0)
+    if first < 1 or last < first:
+        raise argparse.ArgumentTypeError('pages must be N or A-B')
+    return f'{first}-{last}' if match[2] else f'1-{first}'
+
+
+def selected_pages(pages):
+    """How many pages a canonical page selection reads."""
+    first, last = pages.split('-')
+    return int(last) - int(first) + 1
+
+
+def capped(text, maximum):
+    """Text cut to at most maximum characters, and whether it was cut; None leaves it whole."""
+    truncated = maximum is not None and len(text) > maximum
+    return (text[:maximum] if truncated else text), truncated
 
 
 def ceiling(until=None):

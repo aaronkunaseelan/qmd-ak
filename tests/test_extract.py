@@ -1,5 +1,6 @@
 """Pure extraction at the filesystem and CLI edges; no Azure calls."""
 
+import errno
 import http.server
 import json
 import os
@@ -7,6 +8,8 @@ from pathlib import Path
 import subprocess
 import sys
 import threading
+
+from qmd2 import attachments
 
 
 def test_extract_filesystem_cli(tmp_path):
@@ -53,7 +56,12 @@ def test_extract_filesystem_cli(tmp_path):
             'Bright harbor [map](https://example.test/).\n\n![](https://example.test/beacon.png)',
             None,
         ),
-        ([str(home / 'missing')], None, None, 'FileNotFoundError'),
+        (
+            [str(home / 'missing')],
+            None,
+            None,
+            f'FileNotFoundError ENOENT ({os.strerror(errno.ENOENT)})',
+        ),
     ]:
         result = subprocess.run(
             command + ['extract', *args, '--json'], input=body, env=env, capture_output=True
@@ -90,7 +98,7 @@ def test_extract_v1_additions_are_optional_subprocess(tmp_path):
         check=True,
     )
     payload = json.loads(produced.stdout)
-    additions = ('title', 'author', 'published', 'fetched')
+    additions = ('title', 'author', 'published', 'fetched', 'truncated')
     cases = [(payload, True)]
     cases += [
         ({key: value for key, value in payload.items() if key != field}, True)
@@ -155,7 +163,7 @@ class ExtractHandler(http.server.BaseHTTPRequestHandler):
         pass
 
 
-def test_extract_url_http_subprocess(tmp_path):
+def test_extract_url_http_subprocess(tmp_path, open_guard_cli):
     home = tmp_path / 'home'
     home.mkdir()
     env = dict(os.environ, HOME=str(home), TMPDIR=str(home), PYTHONDONTWRITEBYTECODE='1')
@@ -176,10 +184,7 @@ def test_extract_url_http_subprocess(tmp_path):
             ('/503', 503, '/503', 'mullvad_key_missing'),
         ]:
             result = subprocess.run(
-                [
-                    sys.executable,
-                    '-m',
-                    'qmd2.cli',
+                open_guard_cli + [
                     '--home',
                     str(home / 'qmd'),
                     'extract',
@@ -208,3 +213,93 @@ def test_extract_url_http_subprocess(tmp_path):
         server.shutdown()
         server.server_close()
         thread.join()
+
+
+PDF = b'%PDF-1.4\nsynthetic scan\n'
+
+
+def run_extract(capsys, *argv):
+    from qmd2 import cli
+
+    args = cli.build_parser().parse_args(['extract', *argv])
+    code = cli.extract_command(args)
+    return code, json.loads(capsys.readouterr().out)
+
+
+def contract_exit(payload):
+    from qmd2 import cli
+
+    return subprocess.run(
+        [
+            sys.executable,
+            '-I',
+            str(Path(__file__).with_name('validate.py')),
+            str(Path(cli.__file__).parent / 'contracts/qmd.extract.v1.json'),
+        ],
+        input=json.dumps(payload),
+        capture_output=True,
+        text=True,
+    ).returncode
+
+
+def layout_azure(calls, tmp_path, monkeypatch):
+    """Azure's layout answer without Azure or m3: the test reads back the pages it was asked for."""
+
+    def answer(url, body=None, headers=None, timeout=60):
+        calls.append(url)
+        if 'analyze' in url:
+            return b'', {'Operation-Location': 'https://azure.test/di/operations/1'}
+        return (
+            json.dumps(
+                dict(
+                    status='succeeded',
+                    analyzeResult=dict(content='Bright harbor lighthouse', pages=[{}, {}]),
+                )
+            ).encode(),
+            {},
+        )
+
+    monkeypatch.setenv('HOME', str(tmp_path))
+    key = tmp_path / '.config/agent-secrets/azure-document-intelligence.key'
+    key.parent.mkdir(parents=True)
+    key.write_text('synthetic-key')
+    monkeypatch.setattr(
+        attachments,
+        'env_file',
+        lambda path: {'QMD_DOCUMENT_INTELLIGENCE_ENDPOINT': 'https://azure.test/di'},
+    )
+    monkeypatch.setattr(attachments, 'request', answer)
+    monkeypatch.setattr(attachments, 'page_count', lambda path, kind: 3)
+    # A scan with no text layer: pdftotext finds nothing, and m3 is absent so Azure layout reads it.
+    monkeypatch.setattr(attachments, 'OCR_CONFIG', tmp_path / 'absent-ocr.json')
+
+
+def test_extract_pages_sends_only_that_span(tmp_path, monkeypatch, capsys):
+    calls = []
+    layout_azure(calls, tmp_path, monkeypatch)
+    source = tmp_path / 'scan.pdf'
+    source.write_bytes(PDF)
+    for selection, asked, requested in [('1-2', '1-2', 2), ('3', '1-3', 3)]:
+        calls.clear()
+        code, payload = run_extract(capsys, str(source), '--json', '--pages', selection)
+        assert code == 0, payload
+        assert calls[0].endswith('prebuilt-layout:analyze?api-version=2024-11-30&pages=' + asked)
+        assert payload['pages'] == dict(covered=2, total=3, requested=requested)
+        assert 'truncated' not in payload
+        assert contract_exit(payload) == 0
+
+
+def test_extract_max_chars_cuts_and_marks(tmp_path, capsys):
+    source = tmp_path / 'long.txt'
+    source.write_text('Synthetic lighthouse harbor and a longer beacon sentence')
+    code, cut = run_extract(capsys, str(source), '--json', '--max-chars', '10')
+    assert code == 0, cut
+    assert cut['text'] == 'Synthetic '
+    assert cut['truncated'] is True
+    assert contract_exit(cut) == 0
+    code, whole = run_extract(capsys, str(source), '--json')
+    assert whole['text'] == source.read_text()
+    assert 'truncated' not in whole
+    code, ignored = run_extract(capsys, str(source), '--json', '--pages', '1-2')
+    assert (ignored['pages'], ignored['text']) == (None, source.read_text())
+    assert contract_exit(whole) == 0

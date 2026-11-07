@@ -10,6 +10,7 @@ cleanup() {
 }
 trap cleanup EXIT
 sha=$(git -C "$repo" rev-parse --verify "$ref^{commit}")
+release-guard qmd "$sha" || exit $?
 git -C "$repo" archive "$sha" | tar -x -C "$build"
 # Public exports omit vendored wireproxy; local deployments still build the committed source.
 mkdir -p "$build/vendor/wireproxy"

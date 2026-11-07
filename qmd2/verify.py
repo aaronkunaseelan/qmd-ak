@@ -362,9 +362,55 @@ def raw_get(home):
             if result.returncode:
                 return False
             with target.open('rb') as stream:
-                return hashlib.file_digest(stream, 'sha256').hexdigest() == expected
+                if hashlib.file_digest(stream, 'sha256').hexdigest() != expected:
+                    return False
+        return raw_attachment(home, state)
     except Exception:
         return False
+
+
+def raw_attachment(home, state):
+    """One checkpointed attachment id answers --raw with its archived bytes; nothing to sample passes."""
+    from .attachments import attachment_identifier
+    from .packs import Packs
+
+    packs = Packs(state)
+    cli = os.environ.get('QMD2_VERIFY_CLI', str(Path.home() / '.local/bin/qmd2'))
+    for key, value in state.db.execute(
+        "SELECT key, value FROM checkpoints WHERE key LIKE 'media:%' ORDER BY key"
+    ):
+        identifier, loc = key.removeprefix('media:'), json.loads(value)
+        # Only a local pack: verify never downloads from B2, and only an id --raw accepts as an attachment.
+        if (
+            not attachment_identifier(identifier)
+            or not 0 < loc['rec_len'] <= 8 * 1024 * 1024
+            or not any(
+                packs.path('raw', loc['source'], loc['seq'], sealed).exists()
+                for sealed in (True, False)
+            )
+        ):
+            continue
+        try:
+            head = packs.read(loc)[0]
+        except (FileNotFoundError, OSError):
+            continue
+        expected = (head.get('version') or {}).get('imported_from')
+        # The checkpoint's record must be this attachment's own archive; anything else is the defect.
+        if head.get('kind') != 'archive-only' or head.get('id') != identifier or not expected:
+            return False
+        with tempfile.TemporaryDirectory(prefix='verify-raw-', dir=home) as directory:
+            target = Path(directory) / 'raw'
+            result = subprocess.run(
+                [cli, '--home', str(home), 'get', identifier, '--raw', '--out', str(target)],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=30,
+            )
+            if result.returncode:
+                return False
+            with target.open('rb') as stream:
+                return hashlib.file_digest(stream, 'sha256').hexdigest() == expected
+    return True
 
 
 def check_newest(home, status, checks):

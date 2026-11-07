@@ -157,6 +157,7 @@ class SocksHandler(urllib.request.HTTPHandler, urllib.request.HTTPSHandler):
 
 @contextmanager
 def tunnel(relay, secret):
+    """A SOCKS proxy in front of one relay; the caller builds its opener (see attachments.opener)."""
     with os.fdopen(os.open(LOCK, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600), 'a') as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         if relay['hostname'] == shared_relay():
@@ -205,9 +206,7 @@ def tunnel(relay, secret):
             except OSError:
                 raise Failed('mullvad_tunnel_start_failed') from None
             try:
-                yield urllib.request.build_opener(
-                    urllib.request.ProxyHandler({}), SocksHandler(proxy)
-                ).open
+                yield proxy
             except Exception:
                 if process.poll() is not None:
                     raise Failed('mullvad_tunnel_failed') from None

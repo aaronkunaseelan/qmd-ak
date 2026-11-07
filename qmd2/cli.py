@@ -5,13 +5,14 @@ from contextlib import nullcontext
 import json
 import os
 import re
+import shutil
 import sys
 import time
 import tempfile
 import uuid
 from pathlib import Path
 
-from .doc import ceiling, dumps, render, strict_date, visible
+from .doc import capped, ceiling, dumps, page_selection, render, strict_date, visible
 from .index import Index
 from .packs import Packs
 from .state import DEFAULT_HOME, State
@@ -128,10 +129,7 @@ def read_result(reader, args, identifier, docs):
         + reader.view(d, args.no_quoted, heads)
         for d in docs
     )
-    maximum = getattr(args, 'max_chars', None)
-    truncated = maximum is not None and len(output) > maximum
-    if maximum:
-        output = output[:maximum]
+    output, truncated = capped(output, getattr(args, 'max_chars', None))
     if args.no_quoted:
         docs = [
             dict(d, parts=[p for p in d.get('parts', []) if p['kind'] != 'quoted']) for d in docs
@@ -165,7 +163,8 @@ def add_read_parsers(commands):
             'fathom:<account>:<recording>; calendar:<calendar id>:<event>\n'
             'file:<root>:<relative path>; <claude|codex|pi>:<session>#<entry>\n'
             '<parent>/att/<position>[/<transcript|ocr|summary>]\n'
-            'manual:<sha256>; link:<normalized URL sha256>; gsd-events:<change_set_id>'
+            'manual:<sha256>; link:<normalized URL sha256>; gsd-events:<change_set_id>\n'
+            '--raw on an attachment id returns its original bytes; an output id its document.'
         ),
     )
     get.add_argument('ids', nargs='+')
@@ -184,7 +183,7 @@ def add_read_parsers(commands):
         action='store_true',
         help='Refresh an X post and author context now, or capture/extract and store attachment or URL (cached terminal results reused). Fetches may use network; Azure audio/OCR is paid; HTML/text decode is local.',
     )
-    get.add_argument('--pages', type=int)
+    get.add_argument('--pages', type=page_selection)
     get.add_argument('--no-quoted', action='store_true')
     get.add_argument('--attachments', metavar='head:N')
     thread = commands.add_parser(
@@ -237,6 +236,17 @@ def build_parser():
         description='Operator verb: enqueue historical attachments, newest first; extraction may incur Azure cost.',
     )
     backfill.add_argument('source', choices=['x', 'whatsapp'])
+    recovery = attachments.add_parser(
+        'rescue',
+        description='Operator verb: archive the original bytes of WhatsApp attachments captured in the last N days, oldest first; no extraction, no paid step.',
+    )
+    recovery.add_argument('--days', type=int, default=45)
+    recovery.add_argument('--dry-run', action='store_true')
+    index = attachments.add_parser(
+        'index',
+        description='Operator verb, once after an upgrade: record where each archived attachment record lives, by one walk of both lanes, so no worker, rescue or read path walks them; an interrupted run redoes the walk but its writes resume; read-only with --dry-run.',
+    )
+    index.add_argument('--dry-run', action='store_true')
     add = commands.add_parser(
         'add',
         description='Agents may add freely: stores bytes/extracted output in qmd manual source, group files, id manual:<sha256>. Uses the attachment pipeline (Azure extraction may be paid).',
@@ -245,9 +255,21 @@ def build_parser():
     add.add_argument('--name')
     add.add_argument('--title')
     extract = commands.add_parser(
-        'extract', help='Extract a path, stdin (-) or HTTP(S) URL without archiving or indexing.'
+        'extract',
+        help='Extract a path, stdin (-) or HTTP(S) URL without archiving or indexing.',
+        description='A URL is fetched only when its name resolves to public addresses: loopback, private, link-local, carrier-grade and tailnet addresses are refused as blocked_address at every hop.',
     )
     extract.add_argument('path', metavar='PATH|-|URL')
+    extract.add_argument(
+        '--pages',
+        type=page_selection,
+        help='Pages sent to OCR: N for the first N pages, A-B for a span; ignored for other kinds.',
+    )
+    extract.add_argument(
+        '--max-chars',
+        type=int,
+        help='Cut the text to at most N characters; JSON then says truncated.',
+    )
     extract.add_argument('--json', action='store_true', required=True)
     browse = commands.add_parser(
         'browse',
@@ -290,7 +312,7 @@ def build_parser():
         description='Operator verb: evaluates health and writes verify result/telemetry; --notify also appends local alerts on state change or daily red digest. No external messages.',
     )
     verify.add_argument('--notify', action='store_true')
-    for verb in [*commands.choices.values(), backfill]:
+    for verb in [*commands.choices.values(), backfill, recovery]:
         verb.epilog = LEGEND
     return parser
 
@@ -320,8 +342,8 @@ def parse_args(parser):
             parser.error(
                 '--out requires --raw; --raw requires one id and no rendered-document options'
             )
-        if args.pages is not None and (args.pages < 1 or not args.materialise):
-            parser.error('--pages requires --materialise and a positive number')
+        if args.pages is not None and not args.materialise:
+            parser.error('--pages requires --materialise')
         if args.attachments and not re.fullmatch(r'head:\d+', args.attachments):
             parser.error('--attachments must be head:N')
         args.id = args.ids[0]
@@ -398,6 +420,8 @@ def extract_command(args):
     )
     is_url = args.path.lower().startswith(('http://', 'https://'))
     row = {'ref': dict(source='link', url=args.path) if is_url else {}}
+    if args.pages is not None:
+        row['ref']['pages'] = args.pages
     try:
         with tempfile.TemporaryDirectory(prefix='qmd-extract-', dir='/tmp') as directory:
             path = Path(directory) / 'input'
@@ -415,14 +439,17 @@ def extract_command(args):
             )
             if not text.strip():
                 raise Unavailable('no_text')
+            text, truncated = capped(text, args.max_chars)
             result.update(kind=kind, text=text, model=model)
+            if args.max_chars is not None:
+                result['truncated'] = truncated
     except Exception as error:
         result['error'] = temporary_refusal(error)[1]
     result.update(row.get('metadata', {}))
     result['fetched'] = row.get('fetched')
-    if 'azure_pages' in row:
+    if 'pages_read' in row:
         result['pages'] = dict(
-            covered=row['azure_pages'],
+            covered=row['pages_read'],
             total=row.get('total_pages'),
             requested=row.get('pages_requested'),
         )
@@ -431,46 +458,77 @@ def extract_command(args):
 
 
 def raw_command(home, args, parser):
+    from .attachments import attachment_identifier, media_source, temporary_refusal
+
+    loc = None
+    if attachment_identifier(args.id):
+        # An attachment id answers with its original bytes; an output id keeps its document.
+        try:
+            loc = media_source(
+                home, args.id, lambda message: print(message, file=sys.stderr, flush=True)
+            )
+        except LookupError:
+            raise
+        except Exception as error:
+            print(f'qmd2: unavailable ({temporary_refusal(error)[1]})', file=sys.stderr)
+            return EXIT_CODES['failed'][0]
     entry = None
-    if args.id.startswith('file:'):
+    if loc is None and args.id.startswith('file:'):
         _, root, relative = args.id.split(':', 2)
         entry = State(home).get('files:' + root, {}).get(relative)
-    if isinstance(entry, dict) and entry.get('raw'):
-        doc = dict(entry['ctx'], source='files', where=root + '/' + relative, raw=entry['raw'])
-        if not visible(doc):
-            raise LookupError()
-        docs = [doc]
-    else:
-        docs = get_docs(home, args.id)
-    from .sources.files import credential_name
+    if loc is None:
+        if isinstance(entry, dict) and entry.get('raw'):
+            doc = dict(entry['ctx'], source='files', where=root + '/' + relative, raw=entry['raw'])
+            if not visible(doc):
+                raise LookupError()
+            docs = [doc]
+        else:
+            docs = get_docs(home, args.id)
+        from .sources.files import credential_name
 
-    if len(docs) != 1:
-        parser.error('--raw requires one document id')
-    doc = docs[0]
-    if (
-        doc['source'] == 'files'
-        and (doc.get('credential', True) or credential_name(doc['where']))
-        and not args.out
-    ):
-        parser.error('credential raw bytes require --out')
+        if len(docs) != 1:
+            parser.error('--raw requires one document id')
+        doc = docs[0]
+        if (
+            doc['source'] == 'files'
+            and (doc.get('credential', True) or credential_name(doc['where']))
+            and not args.out
+        ):
+            parser.error('credential raw bytes require --out')
+        loc = doc['raw']
     packs = Packs(State(home))
-    loc = doc['raw']
-    if args.cold or not any(
-        packs.path(loc['stream'], loc['source'], loc['seq'], sealed).exists()
-        for sealed in (False, True)
-    ):
-        from .b2 import B2
-
-        packs.b2 = B2()
-    if args.out:
-        with tempfile.TemporaryDirectory(prefix='.qmd-raw-', dir=args.out.parent) as directory:
-            temporary = Path(directory) / 'raw'
-            with temporary.open('wb') as target:
-                os.fchmod(target.fileno(), 0o600)
-                packs.write_raw(loc, target, args.cold)
-            os.replace(temporary, args.out)
+    if isinstance(loc, Path):
+        cold = False
     else:
-        packs.write_raw(loc, sys.stdout.buffer, args.cold)
+        cold = args.cold or not any(
+            packs.path(loc['stream'], loc['source'], loc['seq'], sealed).exists()
+            for sealed in (False, True)
+        )
+        if cold:
+            from .b2 import B2
+
+            packs.b2 = B2()
+
+    def copy(target):
+        if isinstance(loc, Path):
+            with loc.open('rb') as body:
+                shutil.copyfileobj(body, target, 1024**2)
+        else:
+            packs.write_raw(loc, target, cold)
+
+    try:
+        if args.out:
+            with tempfile.TemporaryDirectory(prefix='.qmd-raw-', dir=args.out.parent) as directory:
+                temporary = Path(directory) / 'raw'
+                with temporary.open('wb') as target:
+                    os.fchmod(target.fileno(), 0o600)
+                    copy(target)
+                os.replace(temporary, args.out)
+        else:
+            copy(sys.stdout.buffer)
+    finally:
+        if isinstance(loc, Path):
+            loc.unlink(missing_ok=True)
     return EXIT_CODES['ok'][0]
 
 
@@ -568,9 +626,16 @@ def main():
 
             return verify_main(['--home', str(home)] + (['--notify'] if args.notify else []))
         if args.command == 'attachments':
-            from .attachments import backfill
+            from .attachments import backfill, index_locators, rescue
 
-            print(dumps(backfill(home, args.source)))
+            if args.attachment_command == 'rescue':
+                result = rescue(home, args.days, args.dry_run)
+                print(dumps(result))
+                return EXIT_CODES['failed' if result.get('reason') else 'ok'][0]
+            elif args.attachment_command == 'index':
+                print(dumps(index_locators(home, args.dry_run)))
+            else:
+                print(dumps(backfill(home, args.source)))
             return EXIT_CODES['ok'][0]
         if args.command == 'add':
             return add_command(home, args, parser)

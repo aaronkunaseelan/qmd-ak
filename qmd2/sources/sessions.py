@@ -1,6 +1,7 @@
 """Native session turns and complete-line readers with checkpointed call context."""
 
 import copy
+import functools
 import json
 import re
 from pathlib import Path
@@ -23,11 +24,13 @@ QMD = re.compile(r'(?<![\w-])(?:~?/[^\s"\x27;]*)?qmd2?(?=\s|["\x27;]|$)')
 
 
 def excluded(project):
-    return (
-        isinstance(project, str)
-        and bool(project)
-        and any(Path(project).is_relative_to(p) for p in EXCLUDED_PROJECT_PATHS)
-    )
+    return isinstance(project, str) and bool(project) and excluded_path(project)
+
+
+@functools.lru_cache(maxsize=4096)
+def excluded_path(project):
+    # Every walk asks this for every session file; Path parsing made it most of ingestd's CPU.
+    return any(Path(project).is_relative_to(p) for p in EXCLUDED_PROJECT_PATHS)
 
 
 def tool(name, arguments):
