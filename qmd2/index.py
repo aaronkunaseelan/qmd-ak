@@ -15,7 +15,7 @@ from .policy import KIND_WEIGHT, text
 
 def schema():
     b = tantivy.SchemaBuilder()
-    for name in ('id', 'item', 'source', 'group', 'kind'):
+    for name in ('id', 'item', 'source', 'group', 'kind', 'origin'):
         b.add_text_field(name, stored=True, tokenizer_name='raw')
     b.add_date_field('time', stored=True, fast=True)
     for name in ('title', 'from', 'context', 'body'):
@@ -23,6 +23,15 @@ def schema():
     for name in ('pointer', 'version'):
         b.add_text_field(name, stored=True, index_option='basic', tokenizer_name='raw')
     return b.build()
+
+
+def has_field(schema, name):
+    """Tantivy exposes no field list; a term query is how it answers for a name."""
+    try:
+        tantivy.Query.term_query(schema, name, '', index_option='basic')
+    except ValueError:
+        return False
+    return True
 
 
 class Index:
@@ -37,6 +46,7 @@ class Index:
             self.index = tantivy.Index.open(str(self.path))
             self.writer = None
         self.schema = self.index.schema
+        self.origin_field = has_field(self.schema, 'origin')
         self.pending = {}
         self.index.reload()
         self.searcher = self.index.searcher()
@@ -124,6 +134,7 @@ class Index:
             'item': doc['item'],
             'source': doc['source'],
             'group': doc['group'],
+            'origin': doc.get('origin', ''),
             'kind': doc['kind'],
             'time': date(doc.get('time')).replace(tzinfo=None),
             'title': doc.get('title', ''),
@@ -141,8 +152,48 @@ class Index:
         self.searcher = self.index.searcher()
         self.pending.clear()
 
+    def origin_clause(self, labels):
+        """Session origin labels; no origin means an interactive session, other groups have none.
+
+        An index built before the origin field holds no steward/gsd sessions, so there
+        interactive is every session and any other label matches nothing.
+        """
+
+        def branch(label):
+            clauses = [(tantivy.Occur.Must, self.term('group', 'sessions'))]
+            if not self.origin_field:
+                if label != 'interactive':
+                    # A schema without the field holds no such session: match nothing.
+                    return tantivy.Query.boolean_query(
+                        [
+                            (tantivy.Occur.Must, tantivy.Query.all_query()),
+                            (tantivy.Occur.MustNot, tantivy.Query.all_query()),
+                        ]
+                    )
+                return tantivy.Query.boolean_query(clauses)
+            if label == 'interactive':
+                clauses.extend(
+                    (tantivy.Occur.MustNot, self.term('origin', other))
+                    for other in ('steward', 'gsd')
+                )
+            else:
+                clauses.append((tantivy.Occur.Must, self.term('origin', label)))
+            return tantivy.Query.boolean_query(clauses)
+
+        return tantivy.Query.boolean_query(
+            [(tantivy.Occur.Should, branch(label)) for label in labels]
+        )
+
     def filters(
-        self, query, source=None, since=None, until=None, exclude=True, include_outcomes=False
+        self,
+        query,
+        source=None,
+        since=None,
+        until=None,
+        exclude=True,
+        include_outcomes=False,
+        origins=None,
+        not_origins=None,
     ):
         clauses = [(tantivy.Occur.Must, query)]
         if not include_outcomes:
@@ -168,6 +219,11 @@ class Index:
                     ),
                 )
             )
+        if origins:
+            clauses.append((tantivy.Occur.Must, self.origin_clause(origins)))
+        if self.origin_field:
+            for label in not_origins or ():
+                clauses.append((tantivy.Occur.MustNot, self.term('origin', label)))
         until = ceiling(until)
         if since or until:
             clauses.append(
@@ -195,7 +251,7 @@ class Index:
                     clauses.append((tantivy.Occur.MustNot, self.term('item', item)))
         return tantivy.Query.boolean_query(clauses)
 
-    def scan(self, source=None, since=None, until=None, query=None):
+    def scan(self, source=None, since=None, until=None, query=None, origins=None, not_origins=None):
         query = self.filters(
             query or tantivy.Query.all_query(),
             source,
@@ -203,6 +259,8 @@ class Index:
             until,
             exclude=False,
             include_outcomes=True,
+            origins=origins,
+            not_origins=not_origins,
         )
         count = self.searcher.search(query, limit=1).count
         for offset in range(0, count, 500):
@@ -211,7 +269,9 @@ class Index:
             ).hits:
                 yield self.row(address)
 
-    def search(self, query, source=None, since=None, limit=10, until=None):
+    def search(
+        self, query, source=None, since=None, limit=10, until=None, origins=None, not_origins=None
+    ):
         words = re.findall(r'\w+', query)
         if not words:
             return []
@@ -221,7 +281,9 @@ class Index:
             parsed = self.index.parse_query(
                 escaped, ['title', 'context', 'body'], conjunction_by_default=conjunction
             )
-            parsed = self.filters(parsed, source, since, until)
+            parsed = self.filters(
+                parsed, source, since, until, origins=origins, not_origins=not_origins
+            )
             grouped = {}
             for page in range(3):
                 hits = self.searcher.search(parsed, limit=200, offset=page * 200, count=False).hits
@@ -282,8 +344,24 @@ class Index:
             rows, key=lambda r: (date(r['time']), r['pointer']['seq'], r['pointer']['rec_off'])
         )
 
-    def browse(self, source=None, since=None, until=None, limit=10, cursor=0):
-        query = self.filters(tantivy.Query.all_query(), source, since, until)
+    def browse(
+        self,
+        source=None,
+        since=None,
+        until=None,
+        limit=10,
+        cursor=0,
+        origins=None,
+        not_origins=None,
+    ):
+        query = self.filters(
+            tantivy.Query.all_query(),
+            source,
+            since,
+            until,
+            origins=origins,
+            not_origins=not_origins,
+        )
         hits = self.searcher.search(query, limit=limit, offset=cursor, order_by_field='time').hits
         rows = [self.row(a) for _, a in hits]
         for row in rows:

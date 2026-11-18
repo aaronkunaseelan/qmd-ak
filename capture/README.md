@@ -23,9 +23,9 @@ is incomplete (`ok:false`, `has_more:true`). Use a scratch state copy for diagno
 A missing provider page preserves its resume cursor. Failed listing items
 retry every run. The first permanent text failure produces an explicit
 `text_unavailable` snapshot counted as excluded and retried at most daily;
-transient daily retries keep that exclusion. Other transient failures stay red.
-After 6 h and 10 tries, transient ids in a run with another successful text fetch
-are excluded as `provider_persistent_<class>` and retried daily.
+transient daily retries keep that exclusion. A timeout or 5xx older than the 1 h
+lane deadline is excluded as `text_timeout` and retried daily, so one id cannot
+hold the lane open for later runs; a newer one keeps the run red.
 
 Spool ABI is `qmd.spool-entry.v1`, unchanged: one fsynced `index.jsonl`
 entry per observation and payload bytes at `objects/<aa>/<bb>/<sha256>`.

@@ -64,10 +64,13 @@ func TestXListingSubprocess(t *testing.T) {
 		t.Fatal("backfill must finish without holding head")
 	}
 	if err := call("normal"); err != nil || r.receipt.RequestsSent != 14 || !r.receipt.Backfill.Done {
-		t.Fatal("done backfill must stay done")
+		t.Fatal("done backfill and a settled walk must stay done")
 	}
-	if err := call("changed"); err != nil || !r.receipt.HeadComplete || r.receipt.Written < 5 {
-		t.Fatalf("changed head must continue to known page: err=%v receipt=%+v", err, r.receipt)
+	if err := call("changed"); err != nil || !r.receipt.HeadComplete || r.receipt.Written != 1 {
+		t.Fatalf("changed head must write the changed save: err=%v receipt=%+v", err, r.receipt)
+	}
+	if calls := birdCalls(t, log); listingCalls(calls, "bookmarks") != 2 {
+		t.Fatal("a changed head must continue to the first unchanged page and stop")
 	}
 	if err := call("cap"); err == nil || r.receipt.RateLimited || r.receipt.HeadComplete || r.receipt.RequestsSent != 26 {
 		t.Fatal("cap during head must be incomplete, and our own cap is not a provider limit")
@@ -136,8 +139,9 @@ cost = {'whoami': 5, 'bookmarks': 1, 'likes': 6, 'user-tweets': 2, 'thread': 1, 
 if mode == 'cap' and kind == 'bookmarks': cost = 6
 if mode == 'tailcap' and '--cursor' in args: cost = 7
 remaining = int(os.environ['XBIRD_REMAINING'])
-json.dump({'requests_sent': min(cost, remaining), 'rate_limited': mode == 'limited'}, open(os.environ['XBIRD_RECEIPT'], 'w'))
-if mode == 'limited' or cost > remaining: sys.exit(1)
+limited = mode == 'limited' or (mode == 'threadlimited' and kind == 'thread')
+json.dump({'requests_sent': min(cost, remaining), 'rate_limited': limited}, open(os.environ['XBIRD_RECEIPT'], 'w'))
+if limited or cost > remaining: sys.exit(1)
 if kind == 'whoami':
     print('user_id: 123')
     sys.exit(0)
@@ -146,6 +150,15 @@ if kind == 'thread':
     sys.exit(0)
 cursor = args[args.index('--cursor') + 1] if '--cursor' in args else '0'
 n = int(cursor)
+if mode in ('saved', 'threadlimited') and kind == 'bookmarks':
+    pages = json.loads((root / 'list.json').read_text())
+    page = pages[min(n, len(pages) - 1)]
+    nxt = str(n + 1) if n + 1 < len(pages) else ''
+    print(json.dumps({'tweets': [{'id': i, 'text': 'synthetic'} for i in page], 'nextCursor': nxt}))
+    sys.exit(0)
+if mode in ('saved', 'threadlimited') and kind in ('likes', 'user-tweets'):
+    print(json.dumps({'tweets': [{'id': kind + '0', 'text': 'synthetic'}], 'nextCursor': ''}))
+    sys.exit(0)
 ident = kind + cursor
 text = 'changed' if mode == 'changed' and kind == 'bookmarks' and n == 0 else 'synthetic'
 nxt = str(n + 1) if kind in ('bookmarks', 'likes') and n < 4 else ''
@@ -171,6 +184,14 @@ func seedXCapture(root, bird string) *run {
 
 func checkBirdHeadCalls(t *testing.T, log string) {
 	t.Helper()
+	calls := birdCalls(t, log)
+	if len(calls) != 6 || calls[1][1] != "bookmarks" || calls[2][1] != "likes" || calls[3][1] != "user-tweets" || calls[4][len(calls[4])-1] != "1" {
+		t.Fatal("heads must precede migrated history")
+	}
+}
+
+func birdCalls(t *testing.T, log string) [][]string {
+	t.Helper()
 	raw, err := os.ReadFile(log)
 	if err != nil {
 		t.Fatal(err)
@@ -183,7 +204,15 @@ func checkBirdHeadCalls(t *testing.T, log string) {
 		}
 		calls = append(calls, args)
 	}
-	if len(calls) != 6 || calls[1][1] != "bookmarks" || calls[2][1] != "likes" || calls[3][1] != "user-tweets" || calls[4][len(calls[4])-1] != "1" {
-		t.Fatal("heads must precede migrated history")
+	return calls
+}
+
+func listingCalls(calls [][]string, list string) int {
+	n := 0
+	for _, args := range calls {
+		if len(args) > 1 && args[1] == list {
+			n++
+		}
 	}
+	return n
 }

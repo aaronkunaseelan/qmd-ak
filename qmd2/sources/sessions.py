@@ -3,16 +3,18 @@
 import copy
 import functools
 import json
+import os
 import re
 from pathlib import Path
 
-PARSER_VERSION = 3
-EXCLUDED_PROJECTS = (
-    str(Path.home() / '.local/state/steward'),
-    str(Path.home() / '.local/share/steward'),
-    str(Path.home() / '.local/share/gsd'),
+PARSER_VERSION = 4
+ORIGINS = (
+    (str(Path.home() / '.local/state/steward'), 'steward'),
+    (str(Path.home() / '.local/share/steward'), 'steward'),
+    (str(Path.home() / '.local/share/gsd'), 'gsd'),
 )
-EXCLUDED_PROJECT_PATHS = tuple(Path(p) for p in EXCLUDED_PROJECTS)
+ORIGIN_PATHS = tuple((Path(p), label) for p, label in ORIGINS)
+ORIGIN_LABELS = ('steward', 'gsd', 'interactive')
 ROOTS = [
     ('pi', Path.home() / 'agents/pi/sessions'),
     ('codex', Path.home() / '.codex/sessions'),
@@ -23,14 +25,15 @@ ROOTS = [
 QMD = re.compile(r'(?<![\w-])(?:~?/[^\s"\x27;]*)?qmd2?(?=\s|["\x27;]|$)')
 
 
-def excluded(project):
-    return isinstance(project, str) and bool(project) and excluded_path(project)
-
-
 @functools.lru_cache(maxsize=4096)
-def excluded_path(project):
+def origin(project):
     # Every walk asks this for every session file; Path parsing made it most of ingestd's CPU.
-    return any(Path(project).is_relative_to(p) for p in EXCLUDED_PROJECT_PATHS)
+    if isinstance(project, str) and project:
+        path = Path(project)
+        for root, label in ORIGIN_PATHS:
+            if path.is_relative_to(root):
+                return label
+    return 'interactive'
 
 
 def tool(name, arguments):
@@ -74,8 +77,6 @@ def prepare(row, ctx):
     project = row.get('cwd', m.get('cwd'))
     if project:
         ctx['project'] = project
-    if excluded(ctx.get('project')):
-        return {k: v for k, v in ctx.items() if k not in ('first_user', 'title', 'calls')}
     if typ in ('custom-title', 'session_info'):
         ctx['title'] = row.get(
             'customTitle', row.get('title', row.get('name', ctx.get('title', '')))
@@ -121,8 +122,6 @@ def completed(row, ctx):
 
 
 def parse(raw, ctx):
-    if excluded(ctx.get('project')):
-        return []
     runtime = ctx['runtime']
     session = ctx.get('session', 'unknown')
     offset = ctx.get('offset', 0)
@@ -152,6 +151,7 @@ def parse(raw, ctx):
             'item': item,
             'source': runtime,
             'group': 'sessions',
+            'origin': origin(ctx.get('project')),
             'kind': 'authored' if any(p['kind'] == 'authored' for p in parts) else 'tool_output',
             'time': row.get(
                 'timestamp', m.get('timestamp', ctx.get('time', '1970-01-01T00:00:00Z'))
@@ -171,6 +171,7 @@ def parse(raw, ctx):
                 'item': f'{runtime}:{session}',
                 'source': runtime,
                 'group': 'sessions',
+                'origin': origin(ctx.get('project')),
                 'kind': 'binary',
                 'time': ctx.get('time', '1970-01-01T00:00:00Z'),
                 'context': {},
@@ -281,10 +282,15 @@ def inventory(roots=ROOTS):
                 raise NotADirectoryError()
             operation = 'inventory list'
             for path in root.rglob('*.jsonl'):
-                operation = 'inventory stat'
-                st = path.stat()
-                out.append((runtime, path, st))
-                operation = 'inventory list'
+                try:
+                    st = path.stat()
+                except OSError as error:
+                    # A dangling symlink keeps its name; a file the producer deleted does not.
+                    if isinstance(error, FileNotFoundError) and not os.path.lexists(path):
+                        continue
+                    failed.setdefault(runtime, set()).add(f'inventory stat: {type(error).__name__}')
+                else:
+                    out.append((runtime, path, st))
         except OSError as error:
             failed.setdefault(runtime, set()).add(f'{operation}: {type(error).__name__}')
     return sorted(out, key=lambda r: (-r[2].st_mtime, str(r[1]))), failed

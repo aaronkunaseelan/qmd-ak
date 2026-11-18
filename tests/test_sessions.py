@@ -13,7 +13,7 @@ from qmd2.doc import render, version
 from qmd2.index import Index
 from qmd2.packs import Packs
 from qmd2.policy import text
-from qmd2.sources.sessions import context, import_context, lines, parse, prepare
+from qmd2.sources.sessions import context, import_context, lines, origin, parse, prepare
 from qmd2.state import State
 
 
@@ -178,25 +178,35 @@ ROWS = [
         'authored',
         'synthetic lighthouse',
     ),
-] + [
-    (
-        runtime,
-        {'cwd': project, 'message': {'role': 'user', 'content': 'synthetic lighthouse'}},
-        None if blocked else 'authored',
-        '' if blocked else 'synthetic lighthouse',
-    )
-    for runtime in ('claude', 'codex', 'pi')
-    for project, blocked in (
-        (str(Path.home()) + '/.local/state/steward', True),
-        (str(Path.home()) + '/.local/state/steward/wakes/job', True),
-        (str(Path.home()) + '/.local/share/steward/agents/job', True),
-        (str(Path.home()) + '/.local/share/gsd/steps/job', True),
-        (str(Path.home()) + '/.local/state/stewardship', False),
-        (str(Path.home()) + '/.local/share/steward-other', False),
-        (str(Path.home()) + '/.local/share/gsd-other', False),
-        (None, False),
-    )
 ]
+
+ORIGIN_PROJECTS = [
+    (str(Path.home()) + '/.local/state/steward', 'steward'),
+    (str(Path.home()) + '/.local/state/steward/wakes/165', 'steward'),
+    (str(Path.home()) + '/.local/share/steward/agents/job', 'steward'),
+    (str(Path.home()) + '/.local/share/gsd', 'gsd'),
+    (str(Path.home()) + '/.local/share/gsd/runs/exp1-0813-0821', 'gsd'),
+    (str(Path.home()) + '/.local/state/stewardship', 'interactive'),
+    (str(Path.home()) + '/.local/share/steward-other', 'interactive'),
+    (str(Path.home()) + '/.local/share/gsd-other', 'interactive'),
+    (str(Path.home()) + '/.claude/projects/-home-ubuntu--local-state-steward', 'interactive'),
+    ('/synthetic', 'interactive'),
+    (None, 'interactive'),
+]
+
+
+@pytest.mark.parametrize('project,label', ORIGIN_PROJECTS)
+def test_origin_table(project, label):
+    assert origin(project) == label
+
+
+@pytest.mark.parametrize('runtime', ['claude', 'codex', 'pi'])
+@pytest.mark.parametrize('project,label', ORIGIN_PROJECTS)
+def test_parser_origin(runtime, project, label):
+    row = {'cwd': project, 'message': {'role': 'user', 'content': 'synthetic lighthouse'}}
+    ctx = {'runtime': runtime, 'session': 's', 'offset': 17, 'calls': {}}
+    docs = parse(json.dumps(row).encode(), prepare(row, ctx))
+    assert docs[0]['origin'] == label
 
 
 @pytest.mark.parametrize('runtime,row,kind,body', ROWS)
@@ -256,191 +266,193 @@ def test_source_chain(tmp_path, runtime):
     imported_ctx.pop('payload_start', None)
     assert parse(payload, prepare(row, imported_ctx))[0]['id'] == doc['id']
 
+
+@pytest.mark.parametrize('runtime', ['claude'])
+def test_origin_end_to_end(tmp_path, runtime):
     home = tmp_path / 'home'
     store = home / '.local/share/qmd2'
     env = dict(os.environ, HOME=str(home))
-    roots = {
-        'pi': ['agents/pi/sessions'],
-        'codex': ['.codex/sessions', 'agents/codex/sessions'],
-        'claude': ['.claude/projects', 'agents/claude-code/projects'],
+    for name in (
+        '.claude/projects',
+        'agents/claude-code/projects',
+        '.codex/sessions',
+        'agents/codex/sessions',
+        'agents/pi/sessions',
+    ):
+        (home / name).mkdir(parents=True)
+    # Working directories copied from real session records: steward wakes, a gsd run, and work.
+    projects = {
+        'steward': str(home) + '/.local/state/steward/wakes/165',
+        'gsd': str(home) + '/.local/share/gsd/runs/exp1-0813-0821',
+        'interactive': '/synthetic/work',
     }
-    for names in roots.values():
-        for name in names:
-            (home / name).mkdir(parents=True)
-    prefixes = (
-        str(home) + '/.local/state/steward/',
-        str(home) + '/.local/share/steward/',
-        str(home) + '/.local/share/gsd/',
-    )
-    originals, seeded, excluded_ids, kept_ids = {}, [], set(), set()
-
-    def session(root, name, project, body, encoded=False):
-        path = home / root
-        if runtime == 'claude':
-            directory = re.sub(r'[^a-zA-Z0-9]', '-', project or '/synthetic')
-            path /= directory
-        path /= name + '.jsonl'
-        path.parent.mkdir(parents=True, exist_ok=True)
-        message = dict(row)
-        if runtime == 'claude':
-            message.update(sessionId=name, message={'role': 'user', 'content': body})
-            if project and not encoded:
-                message['cwd'] = project
-            records = [message]
-        else:
-            header = {'type': 'session', 'id': name}
-            if project:
-                header['cwd'] = project
-            if runtime == 'codex':
-                header = {'type': 'session_meta', 'payload': header}
-                message['payload'] = {'role': 'user', 'content': body}
-            else:
-                message['message'] = {'role': 'user', 'content': body}
-            records = [header, message]
-        data = b''.join(json.dumps(r).encode() + b'\n' for r in records)
-        path.write_bytes(data)
-        originals[path] = data
-        return path
-
-    for n, prefix in enumerate(prefixes):
-        for r, root in enumerate(roots[runtime]):
-            name = f'excluded-{n}-{r}'
-            path = session(root, name, prefix + 'jobs/run', 'excludedbeacon')
-            excluded_ids.add(f'{runtime}:{name}')
-            if r == 0:
-                seeded.append({'name': name, 'project': prefix + 'jobs/run', 'path': str(path)})
-            kept = f'kept-{n}-{r}'
-            session(root, kept, prefix.rstrip('/') + '-kept/run', 'keptbeacon', encoded=True)
-            kept_ids.add(f'{runtime}:{kept}')
-        legacy = f'legacy-{n}'
-        seeded.append({'name': legacy, 'project': prefix + 'old/run'})
-        excluded_ids.add(f'{runtime}:{legacy}')
-    session(roots[runtime][0], 'unknown', None, 'unknownbeacon')
-    session(roots[runtime][0], 'mention', '/synthetic', 'keptbeacon ' + prefixes[0])
-    kept_ids.update((f'{runtime}:mention', f'{runtime}:kept-indexed'))
-    kept_mtime = 1791849600
-    for path in originals:
-        stamp = kept_mtime + 7200 if path.stem.startswith('excluded-') else kept_mtime
-        os.utime(path, (stamp, stamp))
-
-    # Seed pre-D-170 docs, including files already checkpointed at EOF and legacy-only items.
-    seed_script = '''
-import json
-from pathlib import Path
-import sys
-
-from qmd2.ingestd import Ingestd
-
-runtime, home, rows = sys.argv[1:]
-daemon = Ingestd(home, remote=False)
-for row in json.loads(rows):
-    item = runtime + ':' + row['name']
-    doc = {
-        'id': item + '#old',
-        'item': item,
-        'source': runtime,
-        'group': 'sessions',
-        'kind': 'authored',
-        'time': '2026-10-13T01:00:00Z',
-        'context': {'project': row['project']},
-        'parts': [{'kind': 'authored', 'text': 'excludedbeacon'}],
-        'parser': runtime + '@2',
-    }
-    earlier = dict(doc, id=item + '#early', context={})
-    daemon.record(runtime, b'{}', {}, [earlier, doc])
-    if row.get('path'):
-        path = Path(row['path'])
-        st = path.stat()
-        ctx = dict(runtime=runtime, session=row['name'], offset=st.st_size)
-        ctx['project'] = row['project']
-        daemon.queue_checkpoint(
-            'session:' + str(path), dict(inode=st.st_ino, offset=st.st_size, ctx=ctx)
+    for label, project in projects.items():
+        directory = home / '.claude/projects' / re.sub(r'[^a-zA-Z0-9]', '-', project)
+        directory.mkdir(parents=True)
+        rows = [
+            {
+                'type': 'user',
+                'uuid': 'u1',
+                'sessionId': label,
+                'cwd': project,
+                'timestamp': '2026-10-13T01:00:00Z',
+                'message': {'role': 'user', 'content': 'origin synthetic ' + label + 'beacon'},
+            },
+            {
+                'type': 'assistant',
+                'uuid': 'a1',
+                'sessionId': label,
+                'cwd': project,
+                'timestamp': '2026-10-13T01:01:00Z',
+                'message': {
+                    'role': 'assistant',
+                    'content': [{'type': 'text', 'text': label + 'beacon reply only'}],
+                },
+            },
+        ]
+        (directory / (label + '.jsonl')).write_bytes(
+            b''.join(json.dumps(r).encode() + b'\n' for r in rows)
         )
-doc = dict(
-    doc,
-    id=runtime + ':kept-indexed#old',
-    item=runtime + ':kept-indexed',
-    context={'project': '/synthetic'},
-    parts=[{'kind': 'authored', 'text': 'keptbeacon'}],
-)
-daemon.record(runtime, b'{}', {}, [doc])
-daemon.commit()
-'''
-    subprocess.run(
-        [sys.executable, '-c', seed_script, runtime, str(store), json.dumps(seeded)],
-        env=env,
-        check=True,
-        capture_output=True,
-    )
 
-    def cli(*args, check=True):
+    def cli(*args, check=True, extra=None):
         return subprocess.run(
             [sys.executable, '-m', 'qmd2.cli', '--home', str(store), *args],
-            env=env,
+            env=dict(env, **(extra or {})),
             capture_output=True,
             text=True,
             check=check,
         )
 
-    assert len(json.loads(cli('search', 'excludedbeacon', '--json').stdout)) == 6
-    from qmd2.feed import Feed
+    subprocess.run(
+        [sys.executable, '-m', 'qmd2.ingestd', '--home', str(store), '--no-b2', '--once'],
+        env=env,
+        check=True,
+        capture_output=True,
+    )
 
-    feed = Feed(store, runtime)
-    before = feed.head()
-    feed.close()
-    for walk in range(2):
-        if walk:
-            for path in originals:
-                if path.stem.startswith('excluded-'):
-                    late = {'message': {'role': 'user', 'content': 'excludedbeacon later'}}
-                    originals[path] += json.dumps(late).encode() + b'\n'
-                    path.write_bytes(originals[path])
-                    os.utime(path, (kept_mtime + 14400, kept_mtime + 14400))
-        subprocess.run(
-            [sys.executable, '-m', 'qmd2.ingestd', '--home', str(store), '--no-b2', '--once'],
-            env=env,
-            check=True,
-            capture_output=True,
-        )
-        walked = State(store)
-        assert walked.get('receipt:' + runtime)['source_head'] == kept_mtime + (
-            14400 if walk else 7200
-        )
-        assert walked.get('indexed:' + runtime)['processed_through'] >= kept_mtime + (
-            14400 if walk else 7200
-        )
-        walked.db.close()
-        assert json.loads(cli('search', 'excludedbeacon', '--json').stdout) == []
-        hits = json.loads(cli('search', 'keptbeacon', '--limit', '100', '--json').stdout)
-        assert {h['item'] for h in hits} == kept_ids
-        assert json.loads(cli('search', 'unknownbeacon', '--json').stdout)[0]['item'] == (
-            runtime + ':unknown'
-        )
-        browsed = json.loads(cli('browse', '--source', runtime, '--limit', '100', '--json').stdout)
-        assert {h['item'] for h in browsed['results']} == kept_ids | {runtime + ':unknown'}
-        for item in excluded_ids:
-            assert cli('get', item, check=False).returncode == 3
-        for item in kept_ids:
-            assert 'keptbeacon' in cli('get', item).stdout
-        deletion_feed = json.loads(
-            cli('feed', '--source', runtime, '--after', before, '--json').stdout
-        )
-        tombstones = [r for r in deletion_feed['items'] if r['tombstone']]
-        assert {r['item'] for r in tombstones} == {runtime + ':' + r['name'] for r in seeded}
-        assert len(tombstones) == 12
-        assert all(p.read_bytes() == data for p, data in originals.items())
-    current = State(store)
-    receipt = current.get('receipt:' + runtime)
-    assert receipt['excluded'] == 3 * len(roots[runtime])
-    assert receipt['written'] == 0 and receipt['failed'] == 0
-    captured = Packs(current)
-    for pack in current.packs('raw'):
-        assert all(b'excludedbeacon' not in body for _, _, body in captured.iter_pack(pack))
-    rebuilt = Index(tmp_path / 'rebuilt', True)
-    for pack in current.packs('doc'):
-        for pointer, _, body in captured.iter_pack(pack):
-            rebuilt.upsert(json.loads(body), pointer)
-    rebuilt.commit()
-    assert rebuilt.search('excludedbeacon') == []
-    assert {r['item'] for r in rebuilt.search('keptbeacon', limit=100)} == kept_ids
-    current.db.close()
+    def origins(*args, extra=None):
+        found = cli('search', 'origin synthetic', '--limit', '100', *args, '--json', extra=extra)
+        return {row['origin']: row['item'] for row in json.loads(found.stdout)}
+
+    assert origins() == {
+        'steward': runtime + ':steward',
+        'gsd': runtime + ':gsd',
+        'interactive': runtime + ':interactive',
+    }
+    assert [
+        row['item'] for row in json.loads(cli('search', 'stewardbeacon', '--json').stdout)
+    ] == [runtime + ':steward']
+    assert origins('--not-origin', 'steward,gsd') == {'interactive': runtime + ':interactive'}
+    assert origins('--origin', 'gsd') == {'gsd': runtime + ':gsd'}
+    assert origins('--origin', 'steward,interactive') == {
+        'steward': runtime + ':steward',
+        'interactive': runtime + ':interactive',
+    }
+    browsed = json.loads(
+        cli(
+            'browse',
+            '--source',
+            runtime,
+            '--limit',
+            '100',
+            '--origin',
+            'interactive',
+            '--json',
+        ).stdout
+    )
+    assert {row['item'] for row in browsed['results']} == {runtime + ':interactive'}
+    assert {row['origin'] for row in browsed['results']} == {'interactive'}
+    grepped = json.loads(
+        cli(
+            'grep',
+            'beacon',
+            '--since',
+            '2000-01-01',
+            '--until',
+            '2100-01-01',
+            '--not-origin',
+            'steward,gsd',
+            '--json',
+        ).stdout
+    )
+    assert {row['id'].rsplit('#', 1)[0] for row in grepped} == {runtime + ':interactive'}
+    fed = json.loads(
+        cli(
+            'feed',
+            '--source',
+            runtime,
+            '--after',
+            'qmd1.' + runtime + '.' + '0' * 20 + '.' + '0' * 20,
+            '--origin',
+            'gsd',
+            '--json',
+        ).stdout
+    )
+    assert {row['item'] for row in fed['items']} == {runtime + ':gsd'}
+    unfiltered = json.loads(
+        cli(
+            'feed',
+            '--source',
+            runtime,
+            '--after',
+            'qmd1.' + runtime + '.' + '0' * 20 + '.' + '0' * 20,
+            '--json',
+        ).stdout
+    )
+    assert len(unfiltered['items']) == 6
+    for item in (runtime + ':steward', runtime + ':gsd', runtime + ':interactive'):
+        assert 'beacon' in cli('get', item).stdout
+    bogus = cli('search', 'origin synthetic', '--not-origin', 'interactive', check=False)
+    assert bogus.returncode == 2 and '--not-origin interactive' in bogus.stderr
+    assert cli('search', 'origin synthetic', '--origin', 'own', check=False).returncode == 2
+
+    # QMD_NOT_ORIGIN: the caller cannot read its own runs back, whatever it asks for.
+    scoped = {'QMD_NOT_ORIGIN': 'steward,gsd'}
+    assert origins(extra=scoped) == {'interactive': runtime + ':interactive'}
+    assert origins('--origin', 'steward', extra=scoped) == {}
+    assert origins('--not-origin', 'gsd', extra={'QMD_NOT_ORIGIN': 'steward'}) == {
+        'interactive': runtime + ':interactive'
+    }
+    assert origins(extra={'QMD_NOT_ORIGIN': ''}) == {
+        'steward': runtime + ':steward',
+        'gsd': runtime + ':gsd',
+        'interactive': runtime + ':interactive',
+    }
+    grepped = json.loads(
+        cli(
+            'grep',
+            'beacon',
+            '--since',
+            '2000-01-01',
+            '--until',
+            '2100-01-01',
+            '--json',
+            extra=scoped,
+        ).stdout
+    )
+    assert {row['id'].rsplit('#', 1)[0] for row in grepped} == {runtime + ':interactive'}
+    browsed = json.loads(
+        cli('browse', '--source', runtime, '--limit', '100', '--json', extra=scoped).stdout
+    )
+    assert {row['item'] for row in browsed['results']} == {runtime + ':interactive'}
+    fed = json.loads(
+        cli(
+            'feed',
+            '--source',
+            runtime,
+            '--after',
+            'qmd1.' + runtime + '.' + '0' * 20 + '.' + '0' * 20,
+            '--json',
+            extra=scoped,
+        ).stdout
+    )
+    assert {row['item'] for row in fed['items']} == {runtime + ':interactive'}
+    assert 'beacon' in cli('get', runtime + ':steward', extra=scoped).stdout
+    assert cli('status', '--json', extra=scoped).returncode == 0
+    hidden = cli('search', 'origin synthetic', extra={'QMD_NOT_ORIGIN': 'interactive'}, check=False)
+    assert hidden.returncode == 2 and 'QMD_NOT_ORIGIN' in hidden.stderr
+    unknown = cli(
+        'search', 'origin synthetic', extra={'QMD_NOT_ORIGIN': 'steward,own'}, check=False
+    )
+    assert unknown.returncode == 2 and 'QMD_NOT_ORIGIN' in unknown.stderr
+    assert cli('status', '--json', extra={'QMD_NOT_ORIGIN': 'interactive'}).returncode == 0

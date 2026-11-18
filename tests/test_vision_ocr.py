@@ -254,6 +254,6 @@ def test_a_vision_image_doc_covers_its_one_page(vision, tmp_path, monkeypatch):
     )
     text, model, kind = attachments.extract(row, image(tmp_path))
     doc = attachments.output_doc(row, text, model, kind)
-    assert doc['pages'] == dict(covered=1, total=1, requested=None)
+    assert doc['pages'] == dict(covered=1, total=1, requested=None, azure=0)
     assert 'Extracted' not in render(doc)
     assert row['azure_pages'] == 0 and row['pages_read'] == 1

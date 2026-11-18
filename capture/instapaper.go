@@ -29,6 +29,9 @@ type ipCursor struct {
 	Pending map[string]ipPending         `json:"pending"`
 }
 
+// ipLaneLimit is qmd2's lane deadline for this 720 s cadence (lateness_limit: max(3600, 2 x cadence)).
+const ipLaneLimit = time.Hour
+
 func permanentTextFailure(status int, html []byte) bool {
 	return status == 200 && len(strings.TrimSpace(string(html))) == 0 || status >= 400 && status < 500 && status != 429
 }
@@ -63,14 +66,13 @@ func runInstapaper(ctx context.Context, r *run) error {
 		c.Pending = map[string]ipPending{}
 	}
 	attempted := map[string]bool{}
-	succeeded := 0
 	pendingIDs := make([]string, 0, len(c.Pending))
 	for id := range c.Pending {
 		pendingIDs = append(pendingIDs, id)
 	}
 	sort.Strings(pendingIDs)
 	for _, id := range pendingIDs {
-		if e := r.ipCaptureText(ctx, base, o, &c, attempted, &succeeded, id, c.Pending[id]); e != nil {
+		if e := r.ipCaptureText(ctx, base, o, &c, attempted, id, c.Pending[id]); e != nil {
 			ipSave(r, &c)
 			return e
 		}
@@ -80,9 +82,9 @@ func runInstapaper(ctx context.Context, r *run) error {
 	}
 	if r.pendingOnly {
 		r.receipt.HasMore = true
-		return r.ipFinish(&c, succeeded)
+		return ipSave(r, &c)
 	}
-	return r.ipTraverse(ctx, base, o, &c, attempted, &succeeded)
+	return r.ipTraverse(ctx, base, o, &c, attempted)
 }
 
 func (r *run) ipPost(ctx context.Context, base string, o ipOptions, path string, form url.Values) ([]byte, int, error) {
@@ -125,7 +127,7 @@ func ipSave(r *run, c *ipCursor) error {
 	return r.save()
 }
 
-func (r *run) ipWrite(c *ipCursor, succeeded *int, id string, p ipPending, html []byte, head time.Time, reason string) error {
+func (r *run) ipWrite(c *ipCursor, id string, p ipPending, html []byte, head time.Time, reason string) error {
 	payload, _ := json.Marshal(struct {
 		Bookmark        json.RawMessage `json:"bookmark"`
 		HTML            string          `json:"html"`
@@ -146,7 +148,6 @@ func (r *run) ipWrite(c *ipCursor, succeeded *int, id string, p ipPending, html 
 		r.receipt.ExclusionReasons[reason]++
 	} else {
 		delete(c.Pending, id)
-		(*succeeded)++
 	}
 	if c.Have[p.Folder] == nil {
 		c.Have[p.Folder] = map[string]string{}
@@ -155,38 +156,7 @@ func (r *run) ipWrite(c *ipCursor, succeeded *int, id string, p ipPending, html 
 	return nil
 }
 
-func (r *run) ipFinish(c *ipCursor, succeeded int) error {
-	remaining := r.receipt.FailedIDs[:0]
-	r.receipt.OldestFailed = time.Time{}
-	for _, id := range r.receipt.FailedIDs {
-		p := c.Pending[id]
-		transient := strings.HasPrefix(p.Reason, "http_5") || p.Reason == "timeout/network"
-		if succeeded > 0 && transient && p.Tries >= 10 && time.Since(p.FirstFailedAt) >= 6*time.Hour {
-			p.ExcludedReason = "provider_persistent_" + strings.ReplaceAll(p.Reason, "/", "_")
-			p.RetryAt = time.Now().UTC().Add(24 * time.Hour)
-			var metadata struct {
-				Time json.Number `json:"time"`
-			}
-			json.Unmarshal(p.Bookmark, &metadata)
-			secs, _ := strconv.ParseFloat(metadata.Time.String(), 64)
-			if e := r.ipWrite(c, &succeeded, id, p, nil, time.Unix(int64(secs), 0), p.ExcludedReason); e != nil {
-				return e
-			}
-			r.receipt.Enumerated--
-			r.receipt.Failed--
-			c.Pending[id] = p
-		} else {
-			remaining = append(remaining, id)
-			if r.receipt.OldestFailed.IsZero() || p.FirstFailedAt.Before(r.receipt.OldestFailed) {
-				r.receipt.OldestFailed = p.FirstFailedAt
-			}
-		}
-	}
-	r.receipt.FailedIDs = remaining
-	return ipSave(r, c)
-}
-
-func (r *run) ipCaptureText(ctx context.Context, base string, o ipOptions, c *ipCursor, attempted map[string]bool, succeeded *int, id string, p ipPending) error {
+func (r *run) ipCaptureText(ctx context.Context, base string, o ipOptions, c *ipCursor, attempted map[string]bool, id string, p ipPending) error {
 	attempted[id] = true
 	var metadata struct {
 		Time json.Number `json:"time"`
@@ -202,24 +172,20 @@ func (r *run) ipCaptureText(ctx context.Context, base string, o ipOptions, c *ip
 		return nil
 	}
 	html, status, err := r.ipPost(ctx, base, o, "/api/1/bookmarks/get_text", url.Values{"bookmark_id": {id}})
-	unavailable := err != nil || len(strings.TrimSpace(string(html))) == 0
-	if unavailable {
-		if r.ipUnavailable(c, id, &p, html, status, err) {
+	if err != nil || len(strings.TrimSpace(string(html))) == 0 {
+		reason := r.ipUnavailable(c, id, &p, html, status, err)
+		if reason == "" {
 			return nil
 		}
-		html = nil
+		return r.ipWrite(c, id, p, nil, head, reason)
 	}
-	reason := ""
-	if unavailable {
-		reason = "text_unavailable"
-		p.ExcludedReason = reason
-		p.RetryAt = time.Now().UTC().Add(24 * time.Hour)
-		c.Pending[id] = p
-	}
-	return r.ipWrite(c, succeeded, id, p, html, head, reason)
+	return r.ipWrite(c, id, p, html, head, "")
 }
 
-func (r *run) ipUnavailable(c *ipCursor, id string, p *ipPending, html []byte, status int, err error) bool {
+// ipUnavailable records one failed text fetch and returns the exclusion reason to write, or "" when
+// the id stays a failure this run. A timeout or 5xx older than the lane deadline moves to the daily
+// text-unavailable path as text_timeout, so one id cannot hold the lane open for every later run.
+func (r *run) ipUnavailable(c *ipCursor, id string, p *ipPending, html []byte, status int, err error) string {
 	p.Reason = "timeout/network"
 	if status >= 300 {
 		p.Reason = "http_" + strconv.Itoa(status)
@@ -237,25 +203,34 @@ func (r *run) ipUnavailable(c *ipCursor, id string, p *ipPending, html []byte, s
 	if p.FirstFailedAt.IsZero() {
 		p.FirstFailedAt = p.FailedAt
 	}
+	transient := strings.HasPrefix(p.Reason, "http_5") || p.Reason == "timeout/network"
+	if p.ExcludedReason == "" && transient && time.Since(p.FirstFailedAt) >= ipLaneLimit {
+		p.ExcludedReason = "text_timeout"
+		p.RetryAt = time.Now().UTC().Add(24 * time.Hour)
+		c.Pending[id] = *p
+		return "text_timeout"
+	}
 	if p.ExcludedReason != "" {
 		p.RetryAt = time.Now().UTC().Add(24 * time.Hour)
-	}
-	c.Pending[id] = *p
-	if p.ExcludedReason != "" {
+		c.Pending[id] = *p
 		r.receipt.Enumerated++
 		r.receipt.Excluded++
 		r.receipt.ExclusionReasons[p.ExcludedReason]++
-		return true
+		return ""
 	}
+	c.Pending[id] = *p
 	if !permanentTextFailure(status, html) || (status == 200 && err != nil) {
 		r.fail()
 		r.receipt.FailedIDs = append(r.receipt.FailedIDs, id)
 		if r.receipt.OldestFailed.IsZero() || p.FailedAt.Before(r.receipt.OldestFailed) {
 			r.receipt.OldestFailed = p.FailedAt
 		}
-		return true
+		return ""
 	}
-	return false
+	p.ExcludedReason = "text_unavailable"
+	p.RetryAt = time.Now().UTC().Add(24 * time.Hour)
+	c.Pending[id] = *p
+	return "text_unavailable"
 }
 
 func ipKnown(c *ipCursor, folder string) (map[string]bool, []string) {
@@ -276,7 +251,7 @@ func ipKnown(c *ipCursor, folder string) (map[string]bool, []string) {
 	return known, ids
 }
 
-func (r *run) ipTraverse(ctx context.Context, base string, o ipOptions, c *ipCursor, attempted map[string]bool, succeeded *int) error {
+func (r *run) ipTraverse(ctx context.Context, base string, o ipOptions, c *ipCursor, attempted map[string]bool) error {
 	folders := []string{"unread", "starred", "archive"}
 	for {
 		folder := folders[c.Folder]
@@ -292,7 +267,7 @@ func (r *run) ipTraverse(ctx context.Context, base string, o ipOptions, c *ipCur
 		if json.Unmarshal(b, &records) != nil {
 			return errors.New("Instapaper list invalid")
 		}
-		bookmarks, progress, e := r.ipRecords(ctx, base, o, c, attempted, succeeded, folder, known, records)
+		bookmarks, progress, e := r.ipRecords(ctx, base, o, c, attempted, folder, known, records)
 		if e != nil {
 			return e
 		}
@@ -310,12 +285,12 @@ func (r *run) ipTraverse(ctx context.Context, base string, o ipOptions, c *ipCur
 		}
 		if complete {
 			r.receipt.HeadComplete = !r.receipt.RateLimited
-			return r.ipFinish(c, *succeeded)
+			return ipSave(r, c)
 		}
 	}
 }
 
-func (r *run) ipRecords(ctx context.Context, base string, o ipOptions, c *ipCursor, attempted map[string]bool, succeeded *int, folder string, known map[string]bool, records []json.RawMessage) (int, bool, error) {
+func (r *run) ipRecords(ctx context.Context, base string, o ipOptions, c *ipCursor, attempted map[string]bool, folder string, known map[string]bool, records []json.RawMessage) (int, bool, error) {
 	var e error
 	bookmarks, progress := 0, false
 	for _, raw := range records {
@@ -331,9 +306,7 @@ func (r *run) ipRecords(ctx context.Context, base string, o ipOptions, c *ipCurs
 		switch item.Type {
 		case "user":
 		case "meta":
-			if e := r.ipDelete(c, item.DeleteIDs); e != nil {
-				return 0, false, e
-			}
+			ipDelete(c, folder, item.DeleteIDs)
 		case "bookmark":
 			bookmarks++
 			id := item.ID.String()
@@ -356,7 +329,7 @@ func (r *run) ipRecords(ctx context.Context, base string, o ipOptions, c *ipCurs
 				p = prior
 				p.Bookmark, p.Folder, p.Hash = raw, folder, item.Hash
 			}
-			if e = r.ipCaptureText(ctx, base, o, c, attempted, succeeded, id, p); e != nil {
+			if e = r.ipCaptureText(ctx, base, o, c, attempted, id, p); e != nil {
 				ipSave(r, c)
 				return 0, false, e
 			}
@@ -371,18 +344,17 @@ func (r *run) ipRecords(ctx context.Context, base string, o ipOptions, c *ipCurs
 	return bookmarks, progress, nil
 }
 
-func (r *run) ipDelete(c *ipCursor, deleteIDs string) error {
-	var e error
+// delete_ids names ids no longer in this folder, not deleted bookmarks. Capture never deletes:
+// a bookmark that moved is listed as new where it moved to and captured again with that label.
+func ipDelete(c *ipCursor, folder, deleteIDs string) {
 	for _, id := range strings.Split(deleteIDs, ",") {
 		id = strings.TrimSpace(id)
 		if id == "" {
 			continue
 		}
-		payload, _ := json.Marshal(map[string]string{"bookmark_id": id, "state": "deleted"})
-		if e = r.emit(id, payload, ObservationState{Version: "instapaper-snapshot-v1", Labels: map[string]string{"state": "deleted"}}, time.Time{}); e != nil {
-			return e
+		delete(c.Have[folder], id)
+		if p, ok := c.Pending[id]; ok && p.Folder == folder {
+			delete(c.Pending, id)
 		}
-		delete(c.Pending, id)
 	}
-	return nil
 }

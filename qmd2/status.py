@@ -5,17 +5,17 @@ import time
 from pathlib import Path
 
 from . import installed_git_sha
-from .sources import SOURCES
+from .sources import SOURCES, kill_timeout
 
 
-def lateness_limit(cadence):
-    return max(3600, 2 * (cadence or 0))
+def lateness_limit(cadence, timeout):
+    return max(3600, 2 * (cadence or 0)) + timeout
 
 
-def currency(row, now):
+def currency(row, now, timeout):
     cadence = row.get('cadence_s') or None
     fresh = row.get('fresh_through')
-    limit = lateness_limit(cadence)
+    limit = lateness_limit(cadence, timeout)
     valid_until = fresh + limit if cadence and fresh is not None else None
     return dict(
         fresh_through=fresh,
@@ -58,9 +58,10 @@ def view(home, status):
         row.update(
             lag_s=head_lag(row),
             parser_exclusions=row.get('parser_exclusions', {}),
-            **currency(row, now),
+            **currency(row, now, kill_timeout(name)),
             error=row.get('error') or None,
             rate_limited=bool(row.get('rate_limited', False)),
+            last_failed=row.get('last_failed') or None,
         )
         sources[name] = row
     attachments = result.get('attachments')

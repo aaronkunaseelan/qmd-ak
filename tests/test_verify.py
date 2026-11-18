@@ -1,6 +1,7 @@
 """Real filesystem/subprocess edge: delivery failure does not consume a transition."""
 
 import json
+import re
 import os
 from pathlib import Path
 import subprocess
@@ -54,6 +55,7 @@ def test_delivery(tmp_path):
             last_failure_at=now,
             last_failure=dict(id='synthetic/att/1', reason='HTTPError', at=now),
             worker=dict(heartbeat_at=now),
+            unavailable_by_reason={'media_expired (HTTP 404)': 2},
         ),
         sources={
             'pi': dict(
@@ -99,6 +101,9 @@ def test_delivery(tmp_path):
     assert not checks['pi:discovery']['ok']
     assert not any(name.startswith('disk:') for name in checks)
     assert telemetry['state'] == 'red'
+    word = re.compile(r'[A-Za-z0-9_.:-]{1,80}')
+    labels = [v for m in telemetry['metrics'] for v in m['labels'].values()]
+    assert 'media_expired_HTTP_404' in labels and all(word.fullmatch(v) for v in labels)
     assert run_verify(tmp_path, notify=True).returncode == 0
     assert len(alerts.read_text().splitlines()) == 1
     for epoch, count, legacy, expected in (
@@ -135,7 +140,7 @@ def test_capture_limits_filesystem(tmp_path):
     now = time.time()
     for ok, limited, cadence, age, capture, discovery in (
         (False, True, 720, 300, False, False),
-        (False, True, 720, 3601, False, True),
+        (False, True, 720, 4201, False, True),
         (False, False, 720, 300, True, False),
         (True, False, 86400, 25 * 3600, False, False),
         (True, False, 86400, 49 * 3600, False, True),
@@ -211,7 +216,7 @@ def test_unscheduled_integrity_and_newest_get(tmp_path, monkeypatch, source):
         row = daemon.source_status(source, 0, daemon.index, now)
         assert row['ok'] is None and row['receipt']['ok'] is None
         assert row['parse_failures'] == 1
-        row.update(legacy=1, oldest_pending=now - 3601)
+        row.update(legacy=1, oldest_pending=now - 3901)
         status = dict(written_at=now, heartbeat_at=now, backlog=[], sources={source: row})
         red = evaluate(status, now)
         assert set(red) == {source + ':' + check for check in ('parse', 'legacy', 'ingest')}
@@ -489,3 +494,53 @@ def test_discovery_requires_current_completeness_subprocess(tmp_path, freshness)
         f'{freshness}: contract_current={contract["current"]}, '
         f'verify={outcome["state"]}, red_checks={outcome["red_checks"]}'
     )
+
+
+def test_capture_transient_failure_needs_two_runs(tmp_path):
+    now = time.time()
+    for error, runs, capture in (
+        ('provider transport failed (timeout)', 1, False),
+        ('provider transport failed (reset)', 2, True),
+        ('provider HTTP 500', 1, False),
+        ('request deadline reached', 1, False),
+        ('provider HTTP 429', 1, False),
+        ('provider HTTP 401', 1, True),
+        ('provider response invalid or too large', 1, True),
+    ):
+        receipt = dict(
+            ok=False,
+            enumerated=1,
+            written=0,
+            unchanged=0,
+            excluded=0,
+            failed=1,
+            error=error,
+            failed_runs=runs,
+        )
+        status = dict(
+            written_at=now,
+            heartbeat_at=now,
+            backlog=[],
+            totals={},
+            sources={
+                'x': dict(
+                    receipt=receipt,
+                    cadence_s=720,
+                    last_complete=now,
+                    fresh_through=now,
+                    last_complete_at=now,
+                    source_head=now,
+                    processed_through=now,
+                )
+            },
+        )
+        (tmp_path / 'status.json').write_text(json.dumps(status))
+        (tmp_path / 'verify.json').unlink(missing_ok=True)
+        (tmp_path / 'alerts.jsonl').unlink(missing_ok=True)
+        result = run_verify(tmp_path, notify=True)
+        assert result.returncode == 0, (error, runs)
+        red = json.loads(result.stdout)['red_checks']
+        assert ('x:capture' in red) == capture, (error, runs)
+        if capture:
+            detail = json.loads((tmp_path / 'alerts.jsonl').read_text())['reasons']['x:capture']
+            assert error in detail and f'runs={runs}' in detail, detail

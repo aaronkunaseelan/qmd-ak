@@ -30,33 +30,45 @@ CTX = {'account': 'synthetic', 'key': '42', 'time': '2026-10-13T00:00:00Z'}
 
 
 @pytest.mark.parametrize(
-    'row,kind,failed',
+    'row,kind,bookmarked,failed',
     [
-        (TWEET, 'post', False),
-        ({'tweet': TWEET}, 'post', False),
-        ({'like': TWEET}, 'like', False),
-        ({'bookmark': {'tweet': TWEET}}, 'bookmark', False),
-        ({'like': {'tweetId': '42', 'fullText': 'archive lighthouse'}}, 'like', False),
-        ({'tweet': dict(TWEET, favorited=True)}, 'like', False),
-        ({'tweet': dict(TWEET, bookmarked=True, favorited=True)}, 'bookmark', False),
-        (dict(TWEET, _raw={'legacy': {'bookmarked': True}}), 'bookmark', False),
-        (dict(TWEET, _raw={'legacy': {'favorited': True}}), 'like', False),
-        (dict(TWEET, _raw={'legacy': {'bookmarked': True, 'favorited': True}}), 'bookmark', False),
-        (dict(TWEET, _raw={'legacy': {'bookmarked': False, 'favorited': False}}), 'post', False),
+        (TWEET, 'post', False, False),
+        ({'tweet': TWEET}, 'post', False, False),
+        ({'like': TWEET}, 'like', False, False),
+        ({'bookmark': {'tweet': TWEET}}, 'bookmark', True, False),
+        ({'like': {'tweetId': '42', 'fullText': 'archive lighthouse'}}, 'like', False, False),
+        ({'tweet': dict(TWEET, favorited=True)}, 'like', False, False),
+        ({'tweet': dict(TWEET, bookmarked=True, favorited=True)}, 'bookmark', True, False),
+        (dict(TWEET, _raw={'legacy': {'bookmarked': True}}), 'bookmark', True, False),
+        (dict(TWEET, _raw={'legacy': {'favorited': True}}), 'like', False, False),
+        (
+            dict(TWEET, _raw={'legacy': {'bookmarked': True, 'favorited': True}}),
+            'bookmark',
+            True,
+            False,
+        ),
+        (
+            dict(TWEET, _raw={'legacy': {'bookmarked': False, 'favorited': False}}),
+            'post',
+            False,
+            False,
+        ),
         (
             dict(TWEET, bookmarked=False, favorited=True, _raw={'legacy': {'bookmarked': True}}),
             'like',
             False,
+            False,
         ),
-        (None, 'post', True),
-        ({}, 'post', True),
+        (None, 'post', False, True),
+        ({}, 'post', False, True),
     ],
 )
-def test_x_table(row, kind, failed):
+def test_x_table(row, kind, bookmarked, failed):
     doc = x(json.dumps(row).encode(), CTX)[0]
     assert doc['id'] == doc['item'] == 'x:synthetic:42'
     assert bool(doc.get('parse_failed')) == failed
     assert doc['kind'] == kind
+    assert doc['bookmarked'] is bookmarked
     assert doc['parser'] == 'x@6'
     if not failed:
         assert 'lighthouse' in render(doc)
@@ -72,12 +84,13 @@ def test_x_table(row, kind, failed):
     'row,count,kind,failed',
     [
         (SNAPSHOT, 1, 'article', False),
+        (dict(SNAPSHOT, bookmark=dict(SNAPSHOT['bookmark'], starred='1')), 1, 'article', False),
+        (dict(SNAPSHOT, bookmark=dict(SNAPSHOT['bookmark'], starred=True)), 1, 'article', False),
         ({'bookmark': SNAPSHOT['bookmark']}, 0, '', False),
         (dict(SNAPSHOT, html=''), 0, '', False),
         (dict(SNAPSHOT, html='\n'), 0, '', False),
         (dict(SNAPSHOT, html='<script>hidden</script>'), 0, '', False),
         (dict(SNAPSHOT, html='', text_unavailable=True), 1, 'article', False),
-        ({'bookmark_id': 42, 'state': 'deleted'}, 1, 'tombstone', False),
         (None, 1, 'article', True),
     ],
 )
@@ -93,6 +106,31 @@ def test_instapaper_table(row, count, kind, failed):
         assert bool(docs[0].get('parse_failed')) == failed
         if row and row.get('text_unavailable'):
             assert docs[0]['parts'] == [{'kind': 'boilerplate', 'text': 'Article text unavailable'}]
+
+
+@pytest.mark.parametrize(
+    'ctx,row,where',
+    [
+        (dict(CTX, folder='unread'), SNAPSHOT, ['unread']),
+        (dict(CTX, folder='archive'), SNAPSHOT, ['archive']),
+        (dict(CTX, folder='starred'), SNAPSHOT, ['starred']),
+        (CTX, dict(SNAPSHOT, bookmark=dict(SNAPSHOT['bookmark'], starred='1')), ['starred']),
+        (CTX, dict(SNAPSHOT, bookmark=dict(SNAPSHOT['bookmark'], starred=1)), ['starred']),
+        (dict(CTX, folder='starred', archive_only='true'), SNAPSHOT, ['archive', 'starred']),
+        (dict(CTX, folder='archive', archive_only='true'), SNAPSHOT, ['archive']),
+        (CTX, SNAPSHOT, None),
+    ],
+)
+def test_instapaper_folder_label_is_where(ctx, row, where):
+    doc = instapaper(json.dumps(row).encode(), ctx)[0]
+    assert doc['kind'] == 'article'
+    assert doc.get('where') == where
+
+
+def test_instapaper_deleted_notice_keeps_doc():
+    notice = json.dumps({'bookmark_id': 42, 'state': 'deleted'}).encode()
+    assert instapaper(notice, CTX) == []
+    assert instapaper(json.dumps(SNAPSHOT).encode(), dict(CTX, state='deleted')) == []
 
 
 @pytest.mark.parametrize(
@@ -191,17 +229,10 @@ def test_article_chain(tmp_path, source, row):
             daemon.record(source, deletion, CTX, capture=10)
             if commit_between:
                 daemon.commit()
-                assert daemon.index.lookup(doc['id']) is None
-                tombstones = [
-                    json.loads(body)
-                    for pack in daemon.state.packs('doc')
-                    for _, head, body in daemon.packs.iter_pack(pack)
-                    if head.get('kind') == 'tombstone'
-                ]
-                assert tombstones
+                assert daemon.index.lookup(doc['id'])['kind'] == 'article'
                 while not daemon.reindex(seconds=60):
                     pass
-                assert daemon.index.lookup(doc['id']) is None
+                assert daemon.index.lookup(doc['id'])['kind'] == 'article'
             daemon.record(source, json.dumps(SNAPSHOT).encode(), CTX, capture=9)
             daemon.commit()
             assert daemon.index.lookup(doc['id']) is not None

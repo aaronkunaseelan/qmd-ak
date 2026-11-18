@@ -59,11 +59,15 @@ The lane primitives are generic: fetcher → spool → receipt → `fresh_throug
 | Search policy | `qmd2/policy.py` | Index authored text, not quoted history, boilerplate, binary content or qmd tool echoes. Full documents remain retrievable. |
 | Verify | `qmd2 verify --notify`; `qmd2/verify.py` | Checks receipts, capture/discovery lag, ingest heartbeat, upload backlog and sampled retrieval; publishes red/green with reasons. |
 
-A successful error-free, complete-head receipt advances `fresh_through` to the run's start; provider errors, rate limits and incomplete heads do not. Scheduled currency uses the producer's `valid_until`, with a lateness limit of `max(3600, 2 × cadence_s)`. Consumers must not substitute internal progress clocks for completeness. Use the feed to enumerate late arrivals.
+A successful error-free, complete-head receipt advances `fresh_through` to the run's start; provider errors, rate limits and incomplete heads do not. Scheduled currency uses the producer's `valid_until`, with a lateness limit of `max(3600, 2 × cadence_s) + timeout_s`, the source's kill timeout: the next run starts at `fresh_through + 2 × cadence_s`, so the limit must outlast that run. Consumers must not substitute internal progress clocks for completeness. Use the feed to enumerate late arrivals.
 
 Feed tokens are positions in existing doc packs, not a separate event store. Delivery is at least once; a returned position cannot later have new writes inserted behind it. Arrival bootstrap before the recorded feed epoch is rejected rather than silently starting late. `QMD_UNTIL` provides an inclusive item-time replay ceiling for read commands; it does not reconstruct historical edited versions in ordinary search/get.
 
 Packs seal at 64 MiB or 24 hours. Seekable zstd frames permit ranged B2 reads; locators retain uncompressed coordinates across sealing. Uploaded raw packs and consumed spool payloads can leave disk; the newest document packs are cached up to 8 GiB by default. Unuploaded packs are never evicted. Open packs have a disk-loss window until they seal and upload.
+
+### X lane
+
+X capture reads three lists — bookmarks, likes and your own posts — and stops each at the first page that changed nothing, so a fresh save lands with its post and context in one run. A head scan can never see a post *leaving* a list, so one run a day also walks the whole bookmarks list to its end (13 requests at 250 saves, resumable inside the same request allowance) and queues each save the walk no longer finds for one live per-post re-read: the refreshed document then carries the viewer state of that read, so its `kind` and its `bookmarked` field stop calling it a save. X supplies no bookmark time, so a consumer dates a save by the arrival of the first version that carried the flag.
 
 ## Design decisions
 

@@ -194,3 +194,161 @@ def test_feed_pack_restart_reparse_cli_chain(tmp_path):
         ).returncode
         == 2
     )
+
+
+def test_feed_origin_from_the_doc_and_its_tombstone(tmp_path):
+    """Feed items carry their own origin, so a tombstone is filtered like the doc it removes."""
+    from qmd2.ingestd import Ingestd
+    from qmd2.sources.sessions import ROOTS
+
+    def line(n, project):
+        return json.dumps(
+            {
+                'type': 'user',
+                'uuid': f'u{n}',
+                'sessionId': 's',
+                'cwd': project,
+                'timestamp': '2026-10-13T01:00:00Z',
+                'message': {'role': 'user', 'content': f'origin synthetic {n}'},
+            }
+        ).encode() + b'\n'
+
+    root = tmp_path / 'sessions'
+    root.mkdir()
+    store = tmp_path / 'store'
+    steward = str(Path.home()) + '/.local/state/steward/wakes/165'
+    (root / 's.jsonl').write_bytes(line(1, steward) + line(2, steward))
+    original = ROOTS[:]
+    ROOTS[:] = [('claude', root)]
+    daemon = Ingestd(store, remote=False)
+    try:
+        daemon.last_walk -= 15
+        daemon.sessions(seconds=30)
+        daemon.commit()
+        for old in daemon.index.item('claude:s'):
+            daemon.documents(
+                'claude', [daemon.tombstone('claude', old)], old['version']['raw'], time.time_ns()
+            )
+        daemon.commit()
+    finally:
+        ROOTS[:] = original
+        daemon.upload_pool.shutdown()
+        daemon.index.writer.wait_merging_threads()
+        del daemon.index
+        daemon.state.db.close()
+        daemon.lock.close()
+
+    env = dict(os.environ, HOME=str(tmp_path))
+
+    def cli(*args):
+        return subprocess.run(
+            [sys.executable, '-m', 'qmd2.cli', '--home', str(store), *args],
+            env=env,
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout
+
+    start = 'qmd1.claude.' + '0' * 20 + '.' + '0' * 20
+
+    def feed(*args):
+        return json.loads(
+            cli('feed', '--source', 'claude', '--after', start, *args, '--json')
+        )
+
+    everything = feed()
+    assert [(row['id'], row['tombstone']) for row in everything['items']] == [
+        ('claude:s#u1', False),
+        ('claude:s#u2', False),
+        ('claude:s#u1', True),
+        ('claude:s#u2', True),
+    ]
+    assert {row['origin'] for row in everything['items']} == {'steward'}
+    assert [row['id'] for row in feed('--origin', 'steward')['items']] == [
+        row['id'] for row in everything['items']
+    ]
+    assert feed('--not-origin', 'steward')['items'] == []
+    assert feed('--not-origin', 'steward,gsd')['items'] == []
+    assert feed('--origin', 'interactive')['items'] == []
+    contract = tmp_path / 'feed-contract.json'
+    contract.write_text(cli('contract', 'qmd.feed.v1'))
+    validated = subprocess.run(
+        [sys.executable, '-I', str(Path(__file__).with_name('validate.py')), str(contract)],
+        input=json.dumps(everything),
+        text=True,
+        capture_output=True,
+    )
+    assert validated.returncode == 0, validated.stdout
+
+
+def instapaper_store(tmp_path):
+    """An Instapaper store built through the real record path: two labelled docs and one bare."""
+    from qmd2.ingestd import Ingestd
+
+    store = tmp_path / 'store'
+    daemon = Ingestd(store, remote=False)
+    ctx = {'account': 'synthetic', 'time': '2026-10-13T00:00:00Z'}
+    try:
+        rows = (
+            ('42', 'archive', {}),
+            ('43', 'archive', {'starred': '1'}),
+            ('44', None, {}),
+        )
+        for key, folder, starred in rows:
+            bookmark = dict(
+                starred, bookmark_id=int(key), title='article ' + key, time=1791849600
+            )
+            raw = json.dumps({'bookmark': bookmark, 'html': '<p>synthetic lighthouse</p>'})
+            raw = raw.encode()
+            labels = {'folder': folder} if folder else {}
+            daemon.record('instapaper', raw, dict(ctx, key=key, **labels))
+        daemon.commit()
+    finally:
+        daemon.upload_pool.shutdown()
+        daemon.index.writer.wait_merging_threads()
+        del daemon.index
+        daemon.state.db.close()
+        daemon.lock.close()
+
+    def cli(*args):
+        return subprocess.run(
+            [sys.executable, '-m', 'qmd2.cli', '--home', str(store), *args],
+            env=dict(os.environ, HOME=str(tmp_path)),
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout
+
+    return cli
+
+
+FOLDER_WHERE = {
+    'instapaper:synthetic:42': ['archive'],
+    'instapaper:synthetic:43': ['archive', 'starred'],
+    'instapaper:synthetic:44': None,
+}
+
+
+def test_feed_carries_instapaper_folder_where(tmp_path):
+    """An Instapaper doc's folder labels reach consumers as the feed item's `where`."""
+    cli = instapaper_store(tmp_path)
+    start = 'qmd1.instapaper.' + '0' * 20 + '.' + '0' * 20
+    page = json.loads(cli('feed', '--source', 'instapaper', '--after', start, '--json'))
+    assert {row['id']: row['where'] for row in page['items']} == FOLDER_WHERE
+    contract = tmp_path / 'feed-contract.json'
+    contract.write_text(cli('contract', 'qmd.feed.v1'))
+    validated = subprocess.run(
+        [sys.executable, '-I', str(Path(__file__).with_name('validate.py')), str(contract)],
+        input=json.dumps(page),
+        text=True,
+        capture_output=True,
+    )
+    assert validated.returncode == 0, validated.stdout
+
+
+def test_browse_shows_instapaper_folder_where(tmp_path):
+    """browse reads `where` from an Instapaper doc as it does from a calendar doc."""
+    cli = instapaper_store(tmp_path)
+    browsed = json.loads(cli('browse', '--source', 'instapaper', '--json'))
+    assert {row['id']: row['where'] for row in browsed['results']} == FOLDER_WHERE
+    assert all('end' not in row for row in browsed['results'])

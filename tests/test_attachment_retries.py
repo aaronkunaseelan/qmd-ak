@@ -179,3 +179,91 @@ def test_remote_retry_schedule(tmp_path, monkeypatch, exits, code):
         daemon.index.writer.wait_merging_threads()
         daemon.state.db.close()
         daemon.lock.close()
+
+
+# The stages this pipeline raises itself: one label per literal, and only a disk floor passes.
+STAGE_FAILURES = (
+    ('disk floor', 'temporary'),
+    ('converter failed (exit 7)', 'permanent'),
+    ('converter failed (signal SIGKILL)', 'permanent'),
+    ('media decryption', 'permanent'),
+    ('engine label missing', 'permanent'),
+    ('empty transcription', 'permanent'),
+)
+
+
+@pytest.mark.parametrize('stage,kind', STAGE_FAILURES)
+def test_stage_failed_names_its_stage_and_whether_it_passes(stage, kind):
+    error = attachments.StageFailed(stage)
+    reason = attachments.temporary_refusal(error)[1]
+    assert attachments.temporary_refusal(error) == (kind, f'stage_failed ({stage})')
+    assert str(error) == stage
+    # A label is a literal: no path, URL or message content reaches the status.
+    assert '/' not in reason and ':' not in reason
+
+
+def test_converter_exit_code_reaches_the_label_and_its_stderr_does_not():
+    with pytest.raises(attachments.StageFailed) as failed:
+        attachments.run(
+            [
+                sys.executable,
+                '-c',
+                'import sys; print("/home/private/invoice.pdf", file=sys.stderr); sys.exit(7)',
+            ]
+        )
+    assert failed.value.stage == 'converter failed (exit 7)'
+    assert attachments.temporary_refusal(failed.value) == (
+        'permanent',
+        'stage_failed (converter failed (exit 7))',
+    )
+
+
+def test_converter_killed_by_a_signal_names_the_signal():
+    with pytest.raises(attachments.StageFailed) as killed:
+        attachments.run(
+            [sys.executable, '-c', 'import os, signal; os.kill(os.getpid(), signal.SIGKILL)']
+        )
+    assert killed.value.stage == 'converter failed (signal SIGKILL)'
+    assert attachments.temporary_refusal(killed.value) == (
+        'permanent',
+        'stage_failed (converter failed (signal SIGKILL))',
+    )
+
+
+def test_a_stage_failure_journals_its_item_stage_and_attempt(tmp_path, monkeypatch, capsys):
+    import wave
+
+    clock = [1800000000.0]
+    monkeypatch.setattr(attachments.time, 'time', lambda: clock[0])
+    tool = tmp_path / 'transcribe.py'
+    # A transcriber that names its engine and returns no text: this pipeline's own refusal.
+    tool.write_text(
+        'import json, sys\n'
+        'engine = sys.argv[sys.argv.index("--engine-file") + 1]\n'
+        'open(engine, "w").write(json.dumps({"provider": "synthetic", "model": "none"}))\n'
+    )
+    monkeypatch.setattr(attachments, 'TOOL', tool)
+    audio = tmp_path / 'tone.wav'
+    with wave.open(str(audio), 'wb') as wav:
+        wav.setparams((1, 2, 16000, 0, 'NONE', 'not compressed'))
+        wav.writeframes(b'\x00\x00' * 1600)
+    identifier = 'manual:synthetic-silence'
+    attachments.enqueue(
+        tmp_path,
+        identifier,
+        dict(id=identifier, source='manual', group='files', time=clock[0]),
+        dict(source='manual', path=str(audio)),
+    )
+    first = clock[0]
+    for attempt, offset in enumerate((0, 180), 1):
+        clock[0] = first + offset
+        row = attachments.process(tmp_path, {'id': identifier})
+        assert row['reason'] == 'stage_failed (empty transcription)'
+        assert row['attempts'] == attempt
+        assert row['state'] == ('failed' if attempt == 2 else 'queued')
+    lines = capsys.readouterr().err.strip().splitlines()
+    assert lines == [
+        f'attachments: {identifier} stage_failed (empty transcription) permanent attempt {n}'
+        for n in (1, 2)
+    ]
+    assert str(audio) not in ''.join(lines) and str(tmp_path) not in ''.join(lines)

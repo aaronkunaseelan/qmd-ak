@@ -94,7 +94,17 @@ def read_command(home, args):
 
 
 def grep_command(reader, args):
-    rows = list(reader.grep(args.pattern, args.since, args.until, args.source, args.limit))
+    rows = list(
+        reader.grep(
+            args.pattern,
+            args.since,
+            args.until,
+            args.source,
+            args.limit,
+            origins=args.origin,
+            not_origins=args.not_origin,
+        )
+    )
     print(
         dumps(rows)
         if args.json
@@ -152,6 +162,35 @@ def flag_date(value):
         raise argparse.ArgumentTypeError('invalid ISO date/time') from None
 
 
+ORIGIN_HELP = 'Session origin: a comma list of steward, gsd, interactive.'
+
+
+def origin_labels(value):
+    from .sources.sessions import ORIGIN_LABELS
+
+    labels = [label.strip() for label in value.split(',') if label.strip()]
+    if not labels or any(label not in ORIGIN_LABELS for label in labels):
+        raise argparse.ArgumentTypeError(ORIGIN_HELP)
+    return labels
+
+
+def origin_flags(parser):
+    parser.add_argument(
+        '--origin',
+        type=origin_labels,
+        metavar='LABELS',
+        help=ORIGIN_HELP + ' Non-session items fail it.',
+    )
+    parser.add_argument(
+        '--not-origin',
+        type=origin_labels,
+        metavar='LABELS',
+        help=ORIGIN_HELP
+        + ' Non-session items pass it; interactive there is a usage error.'
+        ' QMD_NOT_ORIGIN unites with it.',
+    )
+
+
 def add_read_parsers(commands):
     get = commands.add_parser(
         'get',
@@ -203,6 +242,7 @@ def add_read_parsers(commands):
     grep.add_argument('--source', action='append')
     grep.add_argument('--limit', type=int, default=100)
     grep.add_argument('--json', action='store_true')
+    origin_flags(grep)
     get.add_argument('--cold', action='store_true', help=argparse.SUPPRESS)
 
 
@@ -210,7 +250,7 @@ def build_parser():
     parser = argparse.ArgumentParser(
         prog='qmd2',
         epilog=LEGEND,
-        description='Personal archive. QMD_UNTIL is an inclusive ISO replay ceiling for reads; explicit --until can only narrow it.',
+        description='Personal archive. QMD_UNTIL is an inclusive ISO replay ceiling for reads; explicit --until can only narrow it. QMD_NOT_ORIGIN hides named session origins (steward,gsd) from search, grep, browse and feed.',
     )
     parser.add_argument(
         '--home', type=Path, default=Path(os.environ.get('QMD2_HOME', DEFAULT_HOME))
@@ -227,6 +267,7 @@ def build_parser():
     search.add_argument('--until', type=flag_date, help=DATE_HELP)
     search.add_argument('--limit', type=int, default=10)
     search.add_argument('--json', action='store_true')
+    origin_flags(search)
     add_read_parsers(commands)
     attachments = commands.add_parser('attachments').add_subparsers(
         dest='attachment_command', required=True
@@ -281,6 +322,7 @@ def build_parser():
     browse.add_argument('--limit', type=int, default=10)
     browse.add_argument('--cursor', type=int, default=0)
     browse.add_argument('--json', action='store_true')
+    origin_flags(browse)
     from .sources import SOURCES
 
     feed = commands.add_parser(
@@ -293,6 +335,7 @@ def build_parser():
     start.add_argument('--since-arrival', type=flag_date, help=DATE_HELP)
     feed.add_argument('--limit', type=int, default=500)
     feed.add_argument('--json', action='store_true', required=True)
+    origin_flags(feed)
     contract = commands.add_parser('contract')
     contract.add_argument('id', choices=['qmd.status.v1', 'qmd.feed.v1', 'qmd.extract.v1'])
     stat = commands.add_parser(
@@ -302,11 +345,12 @@ def build_parser():
     stat.add_argument('--json', action='store_true')
     reindex = commands.add_parser(
         'reindex',
-        description='Operator verb: request an ingestd rebuild/reparse; --reset-source tombstones current source docs and resets capture. Requires coordinated maintenance.',
+        description='Operator verb: request an ingestd rebuild/reparse; --reset-source re-captures a source without touching its docs; --revive-reset rewrites the docs a reset tombstoned. Requires coordinated maintenance.',
     )
     mode = reindex.add_mutually_exclusive_group()
     mode.add_argument('--reparse', dest='source')
     mode.add_argument('--reset-source', dest='reset_source')
+    mode.add_argument('--revive-reset', dest='revive_reset')
     verify = commands.add_parser(
         'verify',
         description='Operator verb: evaluates health and writes verify result/telemetry; --notify also appends local alerts on state change or daily red digest. No external messages.',
@@ -349,6 +393,11 @@ def parse_args(parser):
         args.id = args.ids[0]
     if args.command == 'thread' and args.around < 0:
         parser.error('--around must be nonnegative')
+    if args.command in ('search', 'grep', 'browse', 'feed'):
+        # The environment can only narrow: an explicit --origin still applies beside it.
+        scope = not_origin_scope(parser)
+        if scope:
+            args.not_origin = sorted(set(args.not_origin or ()) | set(scope))
     try:
         if args.command in ('search', 'get', 'thread', 'grep', 'browse', 'feed'):
             ceiling()
@@ -361,14 +410,31 @@ def parse_args(parser):
                 args.since_arrival = strict_date(args.since_arrival).timestamp()
         if args.command == 'grep':
             args.pattern = re.compile(args.regex)
+        if getattr(args, 'not_origin', None) and 'interactive' in args.not_origin:
+            parser.error('--not-origin interactive is a usage error')
     except (ValueError, re.error):
         parser.error('invalid QMD_UNTIL, feed start or regular expression')
     return args
 
 
+def not_origin_scope(parser):
+    """QMD_NOT_ORIGIN: session origins the caller cannot read, united with --not-origin."""
+    labels = [label.strip() for label in os.environ.get('QMD_NOT_ORIGIN', '').split(',')]
+    labels = [label for label in labels if label]
+    if any(label not in ('steward', 'gsd') for label in labels):
+        parser.error('QMD_NOT_ORIGIN may name only steward or gsd')
+    return labels
+
+
 def search_command(home, args):
     rows = Index(home).search(
-        args.query or args.lex, args.source, args.since, args.limit, args.until
+        args.query or args.lex,
+        args.source,
+        args.since,
+        args.limit,
+        args.until,
+        origins=args.origin,
+        not_origins=args.not_origin,
     )
     if args.json:
         print(dumps([discovery_row(row) for row in rows]))
@@ -404,7 +470,7 @@ def add_command(home, args, parser):
 
 
 def extract_command(args):
-    from .attachments import extract, fetch, stream, temporary_refusal, Unavailable
+    from .attachments import extract, fetch, pages_view, stream, temporary_refusal, Unavailable
 
     result = dict(
         schema='qmd.extract.v1',
@@ -447,12 +513,9 @@ def extract_command(args):
         result['error'] = temporary_refusal(error)[1]
     result.update(row.get('metadata', {}))
     result['fetched'] = row.get('fetched')
-    if 'pages_read' in row:
-        result['pages'] = dict(
-            covered=row['pages_read'],
-            total=row.get('total_pages'),
-            requested=row.get('pages_requested'),
-        )
+    pages = pages_view(row)
+    if pages is not None:
+        result['pages'] = pages
     print(dumps(result))
     return EXIT_CODES['failed' if result['error'] else 'ok'][0]
 
@@ -489,10 +552,12 @@ def raw_command(home, args, parser):
         if len(docs) != 1:
             parser.error('--raw requires one document id')
         doc = docs[0]
-        if (
-            doc['source'] == 'files'
-            and (doc.get('credential', True) or credential_name(doc['where']))
-            and not args.out
+        if not args.out and (
+            doc.get('credential')
+            or (
+                doc['source'] == 'files'
+                and (doc.get('credential', True) or credential_name(doc['where']))
+            )
         ):
             parser.error('credential raw bytes require --out')
         loc = doc['raw']
@@ -537,16 +602,26 @@ def discovery_row(row):
 
 
 def browse_command(home, args):
-    rows = Index(home).browse(args.source, args.since, args.until, args.limit, args.cursor)
+    rows = Index(home).browse(
+        args.source,
+        args.since,
+        args.until,
+        args.limit,
+        args.cursor,
+        origins=args.origin,
+        not_origins=args.not_origin,
+    )
     if args.json:
         reader = Reader(home)
         try:
             for row in rows:
-                if row['source'] == 'calendar':
+                if row['source'] in ('calendar', 'instapaper', 'x'):
                     doc = reader.read(row)
-                    row.update(
-                        where=doc.get('where') or None, end=doc.get('context', {}).get('end')
-                    )
+                    row.update(where=doc.get('where') or None)
+                    if 'bookmarked' in doc:
+                        row['bookmarked'] = doc['bookmarked']
+                    if row['source'] == 'calendar':
+                        row['end'] = doc.get('context', {}).get('end')
         finally:
             reader.close()
         print(
@@ -575,7 +650,7 @@ def reindex_command(home, args, parser):
     from .ingestd import atomic
     from .sources import SOURCES
 
-    source = args.source or args.reset_source
+    source = args.source or args.reset_source or args.revive_reset
     if source and source not in [s for s, _, _, _, *rest in SOURCES]:
         parser.error('unknown reparse source')
     heartbeat = json.loads((home / 'heartbeat.json').read_text())
@@ -591,6 +666,7 @@ def reindex_command(home, args, parser):
             'id': id,
             'source': source,
             'reset': bool(args.reset_source),
+            'revive': bool(args.revive_reset),
         },
     )
     reported_wait = False
@@ -607,7 +683,17 @@ def reindex_command(home, args, parser):
     result = json.loads((home / 'reindex.result').read_text())
     if result.get('id') != id or not result.get('ok'):
         raise OSError()
-    print(dumps(result) if args.reset_source else 'reindex complete')
+    print(dumps(result['revived']) if args.revive_reset else 'reindex complete')
+
+
+def feed_items(items, origins, not_origins):
+    """Feed items carry their own origin; only session docs have one."""
+    return [
+        entry
+        for entry in items
+        if (not origins or entry['origin'] in origins)
+        and entry['origin'] not in (not_origins or ())
+    ]
 
 
 def main():
@@ -654,7 +740,10 @@ def main():
 
             feed = Feed(home, args.source)
             try:
-                print(dumps(feed.read(args.after, args.since_arrival, args.limit)))
+                result = feed.read(args.after, args.since_arrival, args.limit)
+                if args.origin or args.not_origin:
+                    result['items'] = feed_items(result['items'], args.origin, args.not_origin)
+                print(dumps(result))
             except ValueError as exc:
                 parser.error(str(exc))
             finally:

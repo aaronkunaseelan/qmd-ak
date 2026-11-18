@@ -28,16 +28,16 @@ from .b2 import B2
 from .doc import Exclusion, date, dumps, version, visible
 from .index import Index
 from .packs import MAINTENANCE_INTERVAL, Packs, payload_integrity, room
-from .sources import SOURCES, ARCHIVE_ONLY_SOURCES
+from .sources import SOURCES, ARCHIVE_ONLY_SOURCES, kill_timeout
 from .sources.files import Walker
+from .sources.repos import Repos
 from .sources.sessions import (
-    EXCLUDED_PROJECTS,
     completed,
     context,
-    excluded,
     import_context,
     inventory,
     lines,
+    origin,
     parse,
     prepare,
 )
@@ -57,6 +57,32 @@ def atomic(path, value):
     os.replace(tmp, path)
 
 
+def tail_region(path, offset):
+    """The up-to-64 bytes ending at offset: the continuity witness a checkpoint stores."""
+    start = max(0, offset - 64)
+    if start == offset:
+        return b''
+    with path.open('rb') as f:
+        f.seek(start)
+        return f.read(offset - start)
+
+
+def append_state(path, cp, st):
+    """'unchanged', 'continue' or 'restart' for a session checkpoint against the file on disk.
+
+    A tail proves the bytes below the offset are the ones recorded, whatever the inode is. A
+    checkpoint from before tails keeps the inode rule once; the next write adds the tail.
+    """
+    offset = cp.get('offset', 0)
+    tail = cp.get('tail')
+    if tail is None:
+        if cp.get('inode') != st.st_ino or st.st_size < offset:
+            return 'restart'
+    elif st.st_size < offset or hashlib.sha256(tail_region(path, offset)).hexdigest() != tail:
+        return 'restart'
+    return 'unchanged' if st.st_size == offset else 'continue'
+
+
 def fresh_through(receipt, started):
     if (
         receipt.get('ok')
@@ -68,6 +94,18 @@ def fresh_through(receipt, started):
     ):
         return started
     return receipt.get('fresh_through')
+
+
+FAILURE_FIELDS = ('ok', 'error', 'failed', 'backfill_error', 'rate_limited')
+
+
+def failed_run(receipt):
+    return (
+        not receipt.get('ok')
+        or bool(receipt.get('failed'))
+        or bool(receipt.get('error'))
+        or bool(receipt.get('backfill_error'))
+    )
 
 
 def replace_receipt(previous, latest, started):
@@ -86,6 +124,22 @@ def replace_receipt(previous, latest, started):
     receipt['oldest_failed'] = (
         (previous.get('oldest_failed') or started) if receipt.get('failed') else None
     )
+    head = receipt.get('source_head')
+    if head is None:
+        receipt.pop('head_at', None)
+    elif head == previous.get('source_head') and 'head_at' in previous:
+        receipt['head_at'] = previous['head_at']
+    else:
+        receipt['head_at'] = now
+    receipt['failed_runs'] = (previous.get('failed_runs', 0) + 1) if failed_run(latest) else 0
+    if failed_run(latest):
+        receipt['last_failed'] = {
+            'at': now,
+            'started': started,
+            **{key: latest[key] for key in FAILURE_FIELDS if key in latest},
+        }
+    elif previous.get('last_failed'):
+        receipt['last_failed'] = previous['last_failed']
     return receipt
 
 
@@ -113,6 +167,7 @@ class Ingestd:
         self.waiting_for_lease = None
         self.heavy_lock = None
         self.visible_index = None
+        self.rebuild_on_start = False
         if self.maintenance and not self.maintenance['source']:
             if self.maintenance['stage'] == 'swap':
                 self.swap_rebuild()
@@ -120,7 +175,18 @@ class Ingestd:
                 self.visible_index = Index(self.home)
                 self.index = Index(self.home, True, self.state, self.home / 'index-rebuild')
         else:
-            self.index = Index(self.home, True, self.state)
+            try:
+                self.index = Index(self.home, True, self.state)
+            except ValueError as error:
+                # A released schema change: the old index stays readable during a full rebuild.
+                # This start writes reindex.request itself, so request() drives the rebuild
+                # (reindex needs a running ingestd) and documents() stops deferring.
+                if self.maintenance or 'schema does not match' not in str(error):
+                    raise
+                self.visible_index = Index(self.home)
+                shutil.rmtree(self.home / 'index-rebuild', ignore_errors=True)
+                self.index = Index(self.home, True, self.state, self.home / 'index-rebuild')
+                self.rebuild_on_start = True
         self.reparse_seen = set((self.maintenance or {}).get('seen', []))
         self.checkpoints = {}
         self.pending = {}
@@ -132,7 +198,6 @@ class Ingestd:
         self.publish_on_commit = True
         self.last_maintenance = 0
         self.last_walk = 0
-        self.session_cleanup_done = False
         self.files = []
         self.fetches = {}
         self.spool_errors = {}
@@ -143,7 +208,22 @@ class Ingestd:
         self.started = time.time()
         self.position = 0
         self.file_walker = Walker()
+        self.repo_walker = Repos()
         self.reindex_doc_id = None
+        self.migrate_session_origin()
+        if self.rebuild_on_start:
+            self.start_reindex(None)
+            request = self.home / 'reindex.request'
+            if not request.exists():
+                atomic(
+                    request,
+                    {
+                        'id': 'schema-rebuild-' + str(int(time.time())),
+                        'source': None,
+                        'reset': False,
+                    },
+                )
+            print('index: schema changed, full rebuild started', file=sys.stderr, flush=True)
 
     def checkpoint(self, key, default=None):
         if key not in self.checkpoints:
@@ -197,6 +277,8 @@ class Ingestd:
             'deleted',
             'size',
             'state',
+            'folder',
+            'archive_only',
             'raw_sha256',
             'item_time',
             'credential',
@@ -392,35 +474,47 @@ class Ingestd:
             return
         deadline = now + seconds
         while time.monotonic() < deadline:
-            source, path, _ = self.files[self.position]
+            source, path, listed = self.files[self.position]
             key = 'session:' + str(path)
             cp = self.checkpoint(key, {}) or {}
             operation = 'session stat'
             try:
                 st = path.stat()
-                if cp.get('inode') == st.st_ino and cp.get('offset') == st.st_size:
+                state = append_state(path, cp, st)
+                if state == 'unchanged':
                     # Most files are unchanged since their checkpoint: count them without reading.
-                    self.unchanged_session(source, path, cp, st)
+                    self.walk_counts[source]['unchanged'] += 1
+                    self.walk_counts[source]['enumerated'] += 1
+                    self.processed(source, st.st_mtime)
+                    if 'tail' not in cp:
+                        # A checkpoint from before tails takes one now: a later rename continues.
+                        tail = hashlib.sha256(tail_region(path, cp.get('offset', 0))).hexdigest()
+                        self.queue_checkpoint(key, cp | {'tail': tail})
                 else:
                     operation = 'session read'
                     ctx = {**context(path, source), **cp.get('ctx', {})}
                     off = cp.get('offset', 0)
-                    if cp.get('inode') != st.st_ino or st.st_size < off:
+                    if state == 'restart':
                         ctx, off = context(path, source), 0
                     if st.st_size > off:
+                        recent = tail_region(path, off)
                         with path.open('rb') as f:
                             f.seek(off)
                             for raw, before, docs, after in lines(f, ctx, 4 * 1024 * 1024):
-                                if not excluded(before.get('project')):
-                                    self.record(source, raw, before, docs)
-                                cp = {'inode': st.st_ino, 'offset': after['offset'], 'ctx': after}
+                                self.record(source, raw, before, docs)
+                                recent = (recent + raw)[-64:]
+                                cp = {
+                                    'inode': st.st_ino,
+                                    'offset': after['offset'],
+                                    'tail': hashlib.sha256(recent).hexdigest(),
+                                    'ctx': after,
+                                }
                                 self.queue_checkpoint(key, cp)
                                 if time.monotonic() - self.last_commit >= 10:
                                     self.commit()
                                 if time.monotonic() >= deadline:
                                     break
-                        if not excluded(cp.get('ctx', ctx).get('project')):
-                            self.walk_counts[source]['written'] += int(cp.get('offset', off) > off)
+                        self.walk_counts[source]['written'] += int(cp.get('offset', off) > off)
                         if (
                             cp.get('offset', off) < st.st_size
                             and st.st_size > cp.get('offset', off) + 1
@@ -432,45 +526,57 @@ class Ingestd:
                                     if time.monotonic() >= deadline:
                                         return
                                     continue
-                    elif not excluded(ctx.get('project')):
+                    else:
                         self.walk_counts[source]['unchanged'] += 1
-                    ctx.update(cp.get('ctx', {}))
-                    if excluded(ctx.get('project')):
-                        self.exclude_session(source, ctx)
                     self.walk_counts[source]['enumerated'] += 1
                     if cp.get('offset', off) >= st.st_size:
                         self.processed(source, st.st_mtime)
             except OSError as error:
-                self.walk_counts[source]['enumerated'] += 1
-                self.walk_counts[source]['failed'] += 1
-                self.walk_errors[source].add(f'{operation}: {type(error).__name__}')
+                if (
+                    operation == 'session stat'
+                    and isinstance(error, FileNotFoundError)
+                    and not os.path.lexists(path)
+                    and cp.get('inode') == listed.st_ino
+                    and cp.get('offset') == listed.st_size
+                ):
+                    # The producer deleted a file that was fully captured: nothing was lost.
+                    self.walk_counts[source]['unchanged'] += 1
+                    self.walk_counts[source]['enumerated'] += 1
+                    self.processed(source, listed.st_mtime)
+                else:
+                    self.walk_counts[source]['enumerated'] += 1
+                    self.walk_counts[source]['failed'] += 1
+                    self.walk_errors[source].add(f'{operation}: {type(error).__name__}')
             self.position += 1
             if self.position >= len(self.files):
                 self.position = 0
                 self.finish_session_walk()
                 return
 
-    def unchanged_session(self, source, path, cp, st):
-        ctx = {**context(path, source), **cp.get('ctx', {})}
-        if excluded(ctx.get('project')):
-            self.exclude_session(source, ctx)
-        else:
-            self.walk_counts[source]['unchanged'] += 1
-        self.walk_counts[source]['enumerated'] += 1
-        self.processed(source, st.st_mtime)
-
-    def exclude_session(self, source, ctx):
-        item = f"{source}:{ctx['session']}"
-        if ctx.get('agent'):
-            item += ':' + ctx['agent']
-        self.excluded_sessions.add((source, item))
-        self.walk_counts[source]['excluded'] += 1
+    def migrate_session_origin(self):
+        # One shot: steward and gsd sessions were never recorded, so those files read from 0.
+        if self.state.get('migration:session-origin') is not None:
+            return
+        stale = [
+            row['key']
+            for row in self.state.db.execute(
+                "SELECT key FROM checkpoints WHERE key LIKE 'session:%'"
+            ).fetchall()
+            if origin((self.checkpoint(row['key'], {}) or {}).get('ctx', {}).get('project'))
+            != 'interactive'
+        ]
+        for key in stale:
+            self.state.db.execute('DELETE FROM checkpoints WHERE key=?', (key,))
+            self.checkpoints.pop(key, None)
+            self.pending.pop(key, None)
+        self.state.set('migration:session-origin', {'count': len(stale), 'at': time.time()})
+        self.state.commit()
+        print(f'sessions: session-origin reset {len(stale)}', file=sys.stderr, flush=True)
 
     def start_session_walk(self, now):
         self.files, failed = inventory()
         self.last_walk = now
         self.walk_started = time.time()
-        self.excluded_sessions = set()
         self.walk_errors = {s: set(failed.get(s, ())) for s in ('claude', 'codex', 'pi')}
         self.walk_counts = {
             s: {
@@ -485,24 +591,6 @@ class Ingestd:
 
     def finish_session_walk(self):
         self.commit()
-        # Sweep legacy-only items once per process; later walks use each file's context.
-        if not self.session_cleanup_done:
-            query = self.index.index.parse_query(
-                ' OR '.join('"' + p + '"' for p in EXCLUDED_PROJECTS), ['context']
-            )
-            for old in self.index.scan(source='sessions', query=query):
-                _, raw = self.packs.read(old['pointer'])
-                doc = json.loads(raw)
-                if excluded(doc.get('context', {}).get('project')):
-                    self.excluded_sessions.add((old['source'], old['item']))
-        for source, item in sorted(self.excluded_sessions):
-            for old in self.index.item(item):
-                self.documents(
-                    source, [self.tombstone(source, old)], old['version']['raw'], time.time_ns()
-                )
-            if time.monotonic() - self.last_commit >= 10:
-                self.commit()
-        self.session_cleanup_done = True
         for source, counts in self.walk_counts.items():
             receipt = self.checkpoint('receipt:' + source, {}) or {}
             counts['enumerated'] = sum(
@@ -697,12 +785,12 @@ class Ingestd:
         return origin
 
     def fetch(self):
-        for source, _, argv, cadence, *options in SOURCES:
+        for source, _, argv, cadence, *_ in SOURCES:
             if not argv or not cadence:
                 continue
             job = self.fetches.get(source)
             if job and job.get('process') and job['process'].poll() is None:
-                if time.monotonic() - job['started'] > (options[0] if options else 300):
+                if time.monotonic() - job['started'] > kill_timeout(source):
                     job['process'].kill()
                 continue
             if job and not job.get('received'):
@@ -1039,7 +1127,7 @@ class Ingestd:
                 self.state.db.execute('DELETE FROM checkpoints WHERE key=?', (row['key'],))
 
     def tombstone(self, source, old):
-        return {
+        doc = {
             'id': old['id'],
             'item': old['item'],
             'source': source,
@@ -1049,18 +1137,17 @@ class Ingestd:
             'parts': [],
             'parser': old['version'].get('parser', ''),
         }
+        if old.get('origin'):
+            doc['origin'] = old['origin']
+        return doc
 
     def reset_source(self, source):
+        """Reset a source's capture only: capture rewrites listed items, so no doc is tombstoned."""
         self.commit()
         job = self.fetches.pop(source, None)
         if job and job.get('process') and job['process'].poll() is None:
             job['process'].kill()
             job['process'].wait(timeout=5)
-        ids = [id for id, _ in self.index.bindings(source)]
-        for id in ids:
-            old = self.index.lookup(id)
-            tombstone = self.tombstone(source, old)
-            self.documents(source, [tombstone], old['version']['raw'], time.time_ns())
         self.context_hashes.pop(source, None)
         self.context_dirty.discard(source)
         self.queue_checkpoint('ctx:' + source, {})
@@ -1090,7 +1177,51 @@ class Ingestd:
                 raise ValueError('capture state outside qmd2 home')
             shutil.rmtree(path, ignore_errors=True)
         self.commit()
-        return len(ids)
+
+    def revive_reset(self, source):
+        """Write again what a reset tombstoned: each id's last version, parsed from its raw."""
+        self.commit()
+        parser = next((p for name, p, *_ in SOURCES if name == source), None)
+        if parser is None:
+            raise ValueError('source parser unavailable')
+        reset_at = (self.checkpoint('reset:' + source, 0) or 0) / 1e9
+        revived = []
+        for row in self.state.db.execute(
+            "SELECT key, value FROM checkpoints WHERE key LIKE 'deleted:%'"
+        ).fetchall():
+            id = row['key'].removeprefix('deleted:')
+            version = json.loads(row['value'])
+            origin = version.get('raw')
+            # A doc id does not start with its source's name: the version's raw says whose it is.
+            if not origin or origin.get('source') != source:
+                continue
+            # A reset tombstone is one written within two minutes of that source's reset.
+            if abs(version.get('capture', 0) / 1e9 - reset_at) > 120:
+                continue
+            head, raw = self.packs.read(origin)
+            ctx = {
+                **head.get('version', {}),
+                'key': head.get('id'),
+                'time': head.get('time'),
+                **(self.checkpoint('ctx:' + source, {}) or {}),
+            }
+            # A bookmark capture still lists reparses to its document; a delete notice yields none.
+            docs = [
+                doc
+                for doc in parser(raw, ctx)
+                if not isinstance(doc, Exclusion)
+                and doc.get('kind') != 'tombstone'
+                and doc.get('id') == id
+            ]
+            if not docs:
+                continue
+            # The revived item's own clock, as a reparse takes it, not the revive's wall clock.
+            self.documents(source, docs, origin, time.time_ns(), item_time=docs[0].get('time'))
+            # Only a write that cleared the tombstone is a revival.
+            if not self.state.get('deleted:' + id):
+                revived.append(id)
+        self.commit()
+        return revived
 
     def swap_rebuild(self):
         target, old = self.home / 'index-rebuild', self.home / 'index-old'
@@ -1138,11 +1269,12 @@ class Ingestd:
         self.reparse_seen = set()
         if not source:
             target = self.home / 'index-rebuild'
-            shutil.rmtree(target, ignore_errors=True)
             self.visible_index = Index(self.home)
-            self.index.writer.wait_merging_threads()
-            del self.index
-            self.index = Index(self.home, True, self.state, target)
+            if self.index.path != target:
+                shutil.rmtree(target, ignore_errors=True)
+                self.index.writer.wait_merging_threads()
+                del self.index
+                self.index = Index(self.home, True, self.state, target)
         self.commit()
 
     def reparse_entry(self, source, doc, origin, capture, item_time=None):
@@ -1395,10 +1527,11 @@ class Ingestd:
             self.reindex_doc_id = None
             result = {'id': request['id'], 'ok': True}
             if request.get('reset'):
-                result['tombstoned'] = self.reset_source(request['source'])
-            else:
-                if not self.reindex(request.get('source'), seconds, request):
-                    return
+                self.reset_source(request['source'])
+            elif request.get('revive'):
+                result['revived'] = self.revive_reset(request['source'])
+            elif not self.reindex(request.get('source'), seconds, request):
+                return
             atomic(self.home / 'reindex.result', result)
         except Exception as e:
             atomic(
@@ -1596,6 +1729,7 @@ class Ingestd:
         for name, action in (
             ('sessions', self.sessions),
             ('files', lambda: self.file_walker.turn(self)),
+            ('repos', lambda: self.repo_walker.turn(self)),
             ('spool', self.spool),
         ):
             try:

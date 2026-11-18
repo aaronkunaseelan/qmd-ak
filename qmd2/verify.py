@@ -7,6 +7,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -15,7 +16,7 @@ from pathlib import Path
 
 from .state import DEFAULT_HOME
 from .exits import EXIT_CODES
-from .sources import head_kind
+from .sources import head_kind, kill_timeout
 from .status import currency, lateness_limit
 from .packs import MAINTENANCE_INTERVAL, SEAL_AGE
 
@@ -49,6 +50,15 @@ REASONS = {
 }
 
 
+# A single run lost to one of these is the provider's fault and clears on the next run.
+TRANSIENT = (
+    'provider transport failed',
+    'provider HTTP 5',
+    'request deadline reached',
+    'provider HTTP 429',
+)
+
+
 def reason(name, failed, status=None):
     if not failed:
         return 'OK'
@@ -57,7 +67,9 @@ def reason(name, failed, status=None):
     row = (status or {}).get('sources', {}).get(source, {})
     if check == 'capture':
         receipt = row.get('receipt') or {}
-        return f"{message}: error={receipt.get('error') or row.get('error') or 'unknown'}; failed={receipt.get('failed')}"
+        error = receipt.get('error') or row.get('error') or 'unknown'
+        runs = receipt.get('failed_runs', 1)
+        return f"{message}: error={error}; failed={receipt.get('failed')}; runs={runs}"
     if name == 'seal:late':
         return 'Open pack overdue for sealing'
     if name == 'spool:blocked':
@@ -147,6 +159,11 @@ def metrics(home, status, now):
     out = []
 
     def metric(name, value, unit, **labels):
+        # telemetry/1 label values are words; mech-d drops the whole document otherwise.
+        labels = {
+            k: re.sub(r'[^A-Za-z0-9_.:-]+', '_', str(v)).strip('_')[:80] or 'unknown'
+            for k, v in labels.items()
+        }
         out.append(dict(name=name, labels=labels, value=value, unit=unit))
 
     add_document_metrics(home, now, out)
@@ -187,6 +204,15 @@ def evaluate(status, now, checks=None, observed=None):
             'Unknown timestamp' if unknown else None,
         )
 
+    def head_check(row, receipt, limit, name):
+        head, at = receipt.get('source_head'), receipt.get('head_at')
+        if at is None or head is None:
+            # Receipts written before head_at existed keep the item-time check.
+            age_check(row.get('processed_through'), limit, name, head)
+            return
+        processed = row.get('processed_through')
+        check((processed is None or processed < head) and now - at > limit, name)
+
     age_check(status.get('written_at'), 300, 'status:stale')
     age_check(status.get('heartbeat_at'), 300, 'ingestd:heartbeat')
     check(
@@ -222,7 +248,8 @@ def evaluate(status, now, checks=None, observed=None):
         age_check(worker.get('heartbeat_at'), 600, 'attachments:worker')
     check(not status['sources'], 'sources:missing')
     for source, row in status['sources'].items():
-        limit = lateness_limit(row.get('cadence_s'))
+        timeout = kill_timeout(source)
+        limit = lateness_limit(row.get('cadence_s'), timeout)
         stamp = row.get('oldest_pending')
         if stamp is not None:
             age_check(stamp, limit, source + ':ingest')
@@ -249,11 +276,15 @@ def evaluate(status, now, checks=None, observed=None):
         check(False, source + ':receipt_missing')
         counts = [receipt[k] for k in ('written', 'unchanged', 'excluded', 'failed')]
         check(receipt['enumerated'] != sum(counts), source + ':receipt')
+        error = receipt.get('error') or row.get('error')
+        runs = receipt.get('failed_runs', 1)
         check(
-            (not receipt['ok'] or receipt['failed'] > 0) and not receipt.get('rate_limited', False),
+            (not receipt['ok'] or receipt['failed'] > 0)
+            and not receipt.get('rate_limited', False)
+            and (runs >= 2 or not str(error or '').startswith(TRANSIENT)),
             source + ':capture',
         )
-        freshness = currency(row, now)
+        freshness = currency(row, now, timeout)
         check(
             freshness['current'] is not True,
             source + ':discovery',
@@ -263,9 +294,7 @@ def evaluate(status, now, checks=None, observed=None):
         if stamp is not None:
             age_check(stamp, limit, source + ':unresolved')
         if head_kind(source) != 'archive-only':
-            age_check(
-                row.get('processed_through'), limit, source + ':head', receipt.get('source_head')
-            )
+            head_check(row, receipt, limit, source + ':head')
     return [c['name'] for c in checks if not c['ok']]
 
 

@@ -4,6 +4,7 @@ import os
 import subprocess
 import sys
 import time
+from pathlib import Path
 
 
 def close_daemon(daemon):
@@ -379,6 +380,18 @@ def test_fetch_receipt_filesystem_subprocess(tmp_path):
         close_daemon(daemon)
 
 
+def test_inventory_keeps_listing_past_a_dangling_symlink(tmp_path):
+    from qmd2.sources.sessions import inventory
+
+    root = tmp_path / 'sessions'
+    root.mkdir()
+    (root / 'a.jsonl').symlink_to('synthetic-missing-target')
+    (root / 'b.jsonl').write_text('{"type":"message"}\n')
+    files, failed = inventory([('codex', root)])
+    assert [path.name for _, path, _ in files] == ['b.jsonl']
+    assert failed == {'codex': {'inventory stat: FileNotFoundError'}}
+
+
 def test_filesystem_subprocess_tail_spool_and_cli(tmp_path):
     lease = tmp_path / 'heavy.lock'
     env = dict(os.environ, HOME=str(tmp_path), QMD2_HEAVY_LEASE=str(lease))
@@ -599,12 +612,12 @@ def test_filesystem_subprocess_tail_spool_and_cli(tmp_path):
         snapshot = json.loads((store / 'status.json').read_text())
         for runtime, receipt in previous.items():
             assert snapshot['sources'][runtime]['receipt'] == receipt
-        for age in (0, 3601):
+        for age in (0, 3901):
             red = evaluate(snapshot, time.time() + age)
             for runtime in previous:
                 assert runtime + ':capture' not in red
                 assert (runtime + ':discovery' in red) == bool(age)
-        # A file disappearing after inventory is a real failure, scoped to its lane.
+        # A file deleted after inventory with bytes beyond its checkpoint is still a failure.
         bulk.unlink()
         daemon.sessions(seconds=30)
         assert daemon.position == 0
@@ -634,6 +647,36 @@ def test_filesystem_subprocess_tail_spool_and_cli(tmp_path):
         for runtime in previous:
             receipt = daemon.status_receipt(runtime, time.time())
             assert receipt['ok'] is True and not receipt.get('error')
+        # A file the producer deleted after a full capture is not a failure.
+        gone = session.with_name('captured-then-gone.jsonl')
+        gone.write_text(
+            json.dumps(
+                dict(appended, id='gone', message={'role': 'user', 'content': 'gone synthetic'})
+            )
+            + '\n'
+        )
+        daemon.last_walk -= 15
+        daemon.sessions(seconds=30)
+        daemon.commit()
+        hold = session.with_name('slice-hold.jsonl')
+        hold.write_bytes(b'{"type":"progress"}\n' * 120000)
+        os.utime(hold, (2100000000, 2100000000))
+        before_delete = inventory()[0]
+        daemon.last_walk -= 15
+        daemon.sessions(seconds=0.01)
+        # The new walk listed every file, then stalled on the hold file before ours.
+        assert daemon.position == 1 and daemon.files[1][1] == hold
+        assert gone in [path for _, path, _ in daemon.files]
+        gone.unlink()
+        daemon.sessions(seconds=30)
+        assert daemon.position == 0
+        daemon.commit()
+        receipt = daemon.status_receipt('pi', time.time())
+        assert receipt['ok'] is True and receipt['failed'] == 0
+        # The deleted file counts like any unchanged file: the hold is the only written one.
+        pi_files = sum(r == 'pi' for r, _, _ in before_delete)
+        assert receipt['unchanged'] + receipt['excluded'] == pi_files - 1
+        assert receipt['enumerated'] == receipt['written'] + pi_files - 1
         # A walk over unchanged files reads none and still counts every file.
         daemon.last_walk -= 15
         daemon.sessions()
@@ -691,11 +734,15 @@ def test_filesystem_subprocess_tail_spool_and_cli(tmp_path):
         json.dumps({'id': 'reset-test', 'source': 'whatsapp', 'reset': True})
     )
     run('qmd2.ingestd', '--home', str(store), '--no-b2', '--once')
-    assert json.loads((store / 'reindex.result').read_text())['tombstoned'] == 1
+    assert json.loads((store / 'reindex.result').read_text()) == {'id': 'reset-test', 'ok': True}
     assert not cursor.exists()
     assert State(store).get('ctx:whatsapp') == {}
+    # A reset now only resets capture: no doc is tombstoned before capture rewrites it.
     assert (
-        json.loads(run('qmd2.cli', '--home', str(store), 'search', 'reset', '--json').stdout) == []
+        json.loads(run('qmd2.cli', '--home', str(store), 'search', 'reset', '--json').stdout)[0][
+            'id'
+        ]
+        == 'wa:synthetic:8@s.whatsapp.net:one'
     )
 
     (store / 'reindex.request').write_text(json.dumps({'id': 'lock-test', 'source': 'pi'}))
@@ -721,3 +768,286 @@ def test_filesystem_subprocess_tail_spool_and_cli(tmp_path):
 
     with lease.open('a') as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+
+def session_line(n, text='origin synthetic', session='c', project='/synthetic'):
+    return (
+        json.dumps(
+            {
+                'type': 'user',
+                'uuid': f'u{n}',
+                'sessionId': session,
+                'cwd': project,
+                'timestamp': '2026-10-13T01:00:00Z',
+                'message': {'role': 'user', 'content': text},
+            }
+        ).encode()
+        + b'\n'
+    )
+
+
+def walk_sessions(daemon):
+    # Advance the walk's elapsed time, then let one bounded pass finish the files.
+    daemon.last_walk -= 15
+    daemon.sessions(seconds=30)
+    daemon.commit()
+
+
+def pack_records(store, stream='raw'):
+    from qmd2.packs import Packs
+    from qmd2.state import State
+
+    state = State(store)
+    packs = Packs(state)
+    count = 0
+    for pack in state.packs(stream):
+        count += sum(1 for _ in packs.iter_pack(pack))
+    state.db.close()
+    return count
+
+
+def test_session_append_continuity_filesystem(tmp_path):
+    from qmd2.ingestd import Ingestd
+    from qmd2.sources.sessions import ROOTS
+    from qmd2.state import State
+
+    root = tmp_path / 'sessions'
+    root.mkdir()
+    store = tmp_path / 'store'
+    session = root / 'c.jsonl'
+    session.write_bytes(session_line(1) + session_line(2) + session_line(3))
+    original_roots = ROOTS[:]
+    try:
+        ROOTS[:] = [('claude', root)]
+        daemon = Ingestd(store, remote=False)
+        try:
+            walk_sessions(daemon)
+            assert pack_records(store) == 3
+            assert {row['id'] for row in daemon.index.item('claude:c')} == {
+                'claude:c#u1',
+                'claude:c#u2',
+                'claude:c#u3',
+            }
+            assert daemon.checkpoint('session:' + str(session))['offset'] == session.stat().st_size
+
+            # (a) The producer writes temp + rename: same bytes, one appended line, a new inode.
+            replacement = session.with_name('c.jsonl.new')
+            replacement.write_bytes(session.read_bytes() + session_line(4))
+            os.replace(replacement, session)
+            walk_sessions(daemon)
+            assert pack_records(store) == 4
+            assert {row['id'] for row in daemon.index.item('claude:c')} == {
+                f'claude:c#u{n}' for n in range(1, 5)
+            }
+            assert daemon.walk_counts['claude']['written'] == 1
+
+            # (b) The same size, one in-place edit inside the tail window: reread from 0.
+            edited = session.read_bytes().replace(b'origin synthetic', b'edited synthetic')
+            assert len(edited) == session.stat().st_size
+            with session.open('r+b') as stream:
+                stream.write(edited)
+            walk_sessions(daemon)
+            assert pack_records(store) == 8
+            assert 'edited synthetic' in daemon.index.lookup('claude:c#u4')['body']
+            # The tail is the witness, so an in-place edit of the same size outside its window
+            # (a first line of a longer file) is invisible to it; the old inode rule missed it too.
+            first = session.read_bytes().replace(b'edited synthetic', b'quirky synthetic', 1)
+            assert len(first) == session.stat().st_size
+            with session.open('r+b') as stream:
+                stream.write(first)
+            walk_sessions(daemon)
+            assert pack_records(store) == 8
+            assert 'quirky' not in daemon.index.lookup('claude:c#u1')['body']
+
+            # (c) A shorter file rereads from 0 with the content now on disk.
+            with session.open('r+b') as stream:
+                stream.truncate(0)
+                stream.write(session_line(9, 'shorter synthetic'))
+            walk_sessions(daemon)
+            assert pack_records(store) == 9
+            assert 'shorter synthetic' in daemon.index.lookup('claude:c#u9')['body']
+            assert daemon.checkpoint('session:' + str(session))['offset'] == session.stat().st_size
+        finally:
+            close_daemon(daemon)
+            del daemon
+
+        # (d) A checkpoint from before tails continues by inode, and the next write adds a tail.
+        session.write_bytes(session_line(1) + session_line(2) + session_line(3))
+        head = len(session_line(1) + session_line(2))
+        st = session.stat()
+        state = State(store, True)
+        state.set(
+            'session:' + str(session),
+            {
+                'inode': st.st_ino,
+                'offset': head,
+                'ctx': {
+                    'runtime': 'claude',
+                    'session': 'c',
+                    'offset': head,
+                    'calls': {},
+                    'project': '/synthetic',
+                },
+            },
+        )
+        state.commit()
+        state.db.close()
+        daemon = Ingestd(store, remote=False)
+        try:
+            before = pack_records(store)
+            walk_sessions(daemon)
+            assert pack_records(store) == before + 1
+            assert daemon.checkpoint('session:' + str(session))['tail']
+            assert 'claude:c#u3' in {row['id'] for row in daemon.index.item('claude:c')}
+        finally:
+            close_daemon(daemon)
+            del daemon
+    finally:
+        ROOTS[:] = original_roots
+
+
+def test_legacy_session_checkpoint_at_end_gains_a_tail(tmp_path):
+    from qmd2.ingestd import Ingestd, tail_region
+    from qmd2.sources.sessions import ROOTS
+    from qmd2.state import State
+
+    root = tmp_path / 'sessions'
+    root.mkdir()
+    store = tmp_path / 'store'
+    session = root / 'c.jsonl'
+    session.write_bytes(session_line(1) + session_line(2))
+    st = session.stat()
+    state = State(store, True)
+    state.set(
+        'session:' + str(session),
+        {
+            'inode': st.st_ino,
+            'offset': st.st_size,
+            'ctx': {
+                'runtime': 'claude',
+                'session': 'c',
+                'offset': st.st_size,
+                'calls': {},
+                'project': '/synthetic',
+            },
+        },
+    )
+    state.commit()
+    state.db.close()
+    original_roots = ROOTS[:]
+    ROOTS[:] = [('claude', root)]
+    try:
+        daemon = Ingestd(store, remote=False)
+        try:
+            walk_sessions(daemon)
+            cp = daemon.checkpoint('session:' + str(session))
+            assert cp['offset'] == st.st_size
+            assert cp['tail'] == hashlib.sha256(tail_region(session, st.st_size)).hexdigest()
+            assert pack_records(store) == 0
+            assert daemon.walk_counts['claude']['written'] == 0
+            # With the tail stored, a later rename plus append continues instead of rereading.
+            replacement = session.with_name('c.jsonl.new')
+            replacement.write_bytes(session.read_bytes() + session_line(3))
+            os.replace(replacement, session)
+            walk_sessions(daemon)
+            assert pack_records(store) == 1
+            assert {row['id'] for row in daemon.index.item('claude:c')} == {'claude:c#u3'}
+        finally:
+            close_daemon(daemon)
+            del daemon
+    finally:
+        ROOTS[:] = original_roots
+
+
+def test_session_origin_migration_once_filesystem(tmp_path):
+    from qmd2.ingestd import Ingestd
+    from qmd2.sources.sessions import ROOTS
+    from qmd2.state import State
+
+    root = tmp_path / 'sessions'
+    root.mkdir()
+    store = tmp_path / 'store'
+    steward = str(Path.home()) + '/.local/state/steward/wakes/165'
+    steward_file = root / 's.jsonl'
+    steward_file.write_bytes(
+        session_line(1, 'migration beacon one', session='s', project=steward)
+        + session_line(2, 'migration beacon two', session='s', project=steward)
+    )
+    other = root / 'o.jsonl'
+    other.write_bytes(session_line(3, session='o'))
+    original_roots = ROOTS[:]
+    ROOTS[:] = [('claude', root)]
+    try:
+        # The store the previous release left: the steward docs recorded and then tombstoned by
+        # the legacy sweep, a steward checkpoint at EOF without a tail, no migration key.
+        daemon = Ingestd(store, remote=False)
+        try:
+            walk_sessions(daemon)
+            for old in daemon.index.item('claude:s'):
+                daemon.documents(
+                    'claude',
+                    [daemon.tombstone('claude', old)],
+                    old['version']['raw'],
+                    time.time_ns(),
+                )
+            daemon.commit()
+            assert daemon.index.item('claude:s') == []
+        finally:
+            close_daemon(daemon)
+            del daemon
+        state = State(store, True)
+        state.db.execute("DELETE FROM checkpoints WHERE key='migration:session-origin'")
+        st = steward_file.stat()
+        state.set(
+            'session:' + str(steward_file),
+            {
+                'inode': st.st_ino,
+                'offset': st.st_size,
+                'ctx': {
+                    'runtime': 'claude',
+                    'session': 's',
+                    'offset': st.st_size,
+                    'calls': {},
+                    'project': steward,
+                },
+            },
+        )
+        state.commit()
+        state.db.close()
+
+        daemon = Ingestd(store, remote=False)
+        try:
+            assert daemon.checkpoint('session:' + str(steward_file)) is None
+            assert daemon.checkpoint('session:' + str(other))['offset'] == other.stat().st_size
+            migration = State(store).get('migration:session-origin')
+            assert migration['count'] == 1 and migration['at'] > 0
+            walk_sessions(daemon)
+            assert pack_records(store) == 5
+            assert {row['id'] for row in daemon.index.item('claude:s')} == {
+                'claude:s#u1',
+                'claude:s#u2',
+            }
+            assert daemon.index.lookup('claude:s#u1')['origin'] == 'steward'
+            hits = daemon.index.search('migration beacon')
+            assert [(row['item'], row['origin']) for row in hits] == [('claude:s', 'steward')]
+            # The reread docs beat the tombstones the legacy sweep wrote over the same ids.
+            from qmd2.cli import get_docs
+
+            assert 'migration beacon one' in get_docs(store, 'claude:s#u1')[0]['parts'][0]['text']
+        finally:
+            close_daemon(daemon)
+            del daemon
+        daemon = Ingestd(store, remote=False)
+        try:
+            assert State(store).get('migration:session-origin') == migration
+            walk_sessions(daemon)
+            assert pack_records(store) == 5
+            assert daemon.walk_counts['claude']['written'] == 0
+            assert daemon.checkpoint('session:' + str(steward_file))['offset'] == (
+                steward_file.stat().st_size
+            )
+        finally:
+            close_daemon(daemon)
+            del daemon
+    finally:
+        ROOTS[:] = original_roots

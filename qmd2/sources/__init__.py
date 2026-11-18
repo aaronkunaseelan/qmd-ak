@@ -14,6 +14,7 @@ from .fathom import parse as parse_fathom
 from .whatsapp import parse as parse_whatsapp
 from .x import parse as parse_x
 from .instapaper import parse as parse_instapaper
+from .repos import parse as parse_repos
 
 _HOME = Path.home() / '.local/share/qmd2'
 ARCHIVE_ONLY_SOURCES = {'legacy': 'custody-unversioned-v1'}
@@ -25,6 +26,13 @@ def head_kind(source):
         if name == source:
             return 'archive-only' if parser is None else 'raw'
     return 'archive-only' if source in ARCHIVE_ONLY_SOURCES else 'raw'
+
+
+def kill_timeout(source):
+    """A source's kill timeout in seconds: its SOURCES option, 300 when it declares none."""
+    row = next((row for row in SOURCES if row[0] == source), None)
+    options = row[4:] if row else ()
+    return options[0] if options else 300
 
 
 def fetch(source, account, *flags):
@@ -81,6 +89,7 @@ SOURCES = [
     ('pi', parse, None, 15),
     ('files', parse_files, None, 24 * 60),
     ('files-archive', None, None, 86400),
+    ('repos', parse_repos, None, 86400),
     ('fathom', parse_fathom, fetch('fathom', configured('fathom_account')), 720, 600),
     ('calendar', parse_calendar, fetch('calendar', configured('calendar_account')), 900, 600),
 ]

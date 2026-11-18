@@ -17,7 +17,8 @@ One JSON object; missing required keys fail explicitly. Example values:
 - `transcription_env: "~/tools/audio/.env"`: secondary audio deployment settings.
 Paths expand `~`. Session roots are home-relative: `agents/pi/sessions`,
 `.codex/sessions`, `.claude/projects`, `agents/codex/sessions`, `agents/claude-code/projects`.
-Sessions in `~/.local/{state/steward,share/steward,share/gsd}` are excluded.
+Sessions in `~/.local/{state/steward,share/steward,share/gsd}` are ingested with `origin`
+steward/gsd; readers filter with `--not-origin` or `QMD_NOT_ORIGIN`.
 
 ## Credentials (never commit these files)
 `/etc/qmd-agent/qmd-agent.env` supplies B2 keys (process env takes precedence):
@@ -43,7 +44,8 @@ VPN: `~/.config/agent-secrets/vpn-browser.env` has `WIREGUARD_PRIVATE_KEY`,
 
 ## Runtime and overrides
 `QMD2_HOME` / `--home`: archive state (default `~/.local/share/qmd2`).
-`QMD_UNTIL`: inclusive ISO replay ceiling. Session self-exclusion reads
+`QMD_UNTIL`: inclusive ISO replay ceiling. `QMD_NOT_ORIGIN`: comma list of `steward,gsd` hidden
+from search, grep, browse and feed; empty is unset. Session self-exclusion reads
 `PI_SESSION_ID, CLAUDE_SESSION_ID, CLAUDE_CODE_SESSION_ID, CODEX_THREAD_ID`.
 `QMD2_VERIFY_CLI`: sampled-read executable; `XDG_STATE_HOME`: telemetry directory.
 `QMD_RCLONE_BIN`, `QMD_RCLONE_CONFIG`: history object download executable/config.

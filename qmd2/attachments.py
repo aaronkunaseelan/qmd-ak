@@ -17,6 +17,7 @@ import os
 import resource
 import re
 import shutil
+import signal
 import socket
 import ssl
 import subprocess
@@ -121,6 +122,17 @@ class ConverterTimeout(TimeoutError, Failed):
     pass
 
 
+class StageFailed(OSError):
+    """A stage of the pipeline refused: the label is one of this module's literals, never data.
+
+    `temporary_refusal` answers `stage_failed (<label>)`, temporary only for a disk floor.
+    """
+
+    def __init__(self, stage):
+        super().__init__(stage)
+        self.stage = stage
+
+
 def detect(body):
     for signature, kind in SIGNATURES:
         if body.startswith(signature):
@@ -171,7 +183,7 @@ def stream(reader, target, encrypted=False):
     kind = extraction_type(detect(first) if not encrypted else 'audio')
     cap = CAPS[route(kind)]
     if shutil.disk_usage(target.parent).free < 8 * 1024**3 + 2 * cap:
-        raise OSError('disk floor')
+        raise StageFailed('disk floor')
     size = 0
     with target.open('wb') as output:
         chunk = first
@@ -196,7 +208,7 @@ def stream_original(reader, target, encrypted=False):
     """Copy original bytes with no type routing, capped at ARCHIVE_LIMIT as they are read."""
     cap = ARCHIVE_LIMIT + (32 if encrypted else 0)
     if shutil.disk_usage(target.parent).free < 8 * 1024**3 + 2 * cap:
-        raise OSError('disk floor')
+        raise StageFailed('disk floor')
     size = 0
     with target.open('wb') as output:
         while chunk := reader.read(1024**2):
@@ -638,6 +650,18 @@ def limits():
     resource.setrlimit(resource.RLIMIT_CORE, (0, 0))
 
 
+def converter_failure(code):
+    """The converter's label: its exit code, or the signal that ended it."""
+    if code >= 0:
+        return f'converter failed (exit {code})'
+    number = -code
+    try:
+        ended = 'signal ' + signal.Signals(number).name
+    except ValueError:
+        ended = f'signal {number}'
+    return f'converter failed ({ended})'
+
+
 def run(argv, timeout=120, data=None, azure=False):
     env = {
         'HOME': str(Path.home()),
@@ -647,8 +671,6 @@ def run(argv, timeout=120, data=None, azure=False):
         'OPENBLAS_NUM_THREADS': '1',
     }
     with tempfile.TemporaryFile() as output, tempfile.TemporaryFile() as errors:
-        import signal
-
         p = subprocess.Popen(
             argv,
             stdin=subprocess.PIPE if data is not None else subprocess.DEVNULL,
@@ -677,7 +699,7 @@ def run(argv, timeout=120, data=None, azure=False):
                     raise urllib.error.HTTPError(
                         '', int(status[1]), 'Azure temporary refusal', None, None
                     )
-            raise OSError('converter failed')
+            raise StageFailed(converter_failure(p.returncode))
         output.seek(0)
         body = output.read(LIMIT + 1)
         if len(body) > LIMIT:
@@ -763,7 +785,7 @@ def decrypt(media, encrypted, target=None, copy=None):
                     finally:
                         child.stdout.close()
                     if child.wait(timeout=120):
-                        raise OSError('media decryption')
+                        raise StageFailed('media decryption')
                 with target.open('rb') as plaintext:
                     digest = hashlib.file_digest(plaintext, 'sha256').digest()
                 length = target.stat().st_size
@@ -1238,12 +1260,12 @@ def transcribe(path):
             reported = json.loads(Path(engine).read_text())
             label = f'{reported["provider"]}:{reported["model"]}'
         except (OSError, ValueError, KeyError, TypeError):
-            raise OSError('engine label missing') from None
+            raise StageFailed('engine label missing') from None
     finally:
         Path(engine).unlink(missing_ok=True)
     text = output.decode().strip()
     if not text:
-        raise OSError('empty transcription')
+        raise StageFailed('empty transcription')
     return text, label + '+' + transcriber_release()
 
 
@@ -1573,6 +1595,20 @@ def parsed_output(doc):
     return doc
 
 
+def pages_view(row):
+    """Page coverage for a document or extract payload; azure is absent when unknown."""
+    if 'pages_read' not in row:
+        return None
+    pages = dict(
+        covered=row['pages_read'],
+        total=row.get('total_pages'),
+        requested=row.get('pages_requested'),
+    )
+    if 'azure_pages' in row:
+        pages['azure'] = row['azure_pages']
+    return pages
+
+
 def output_doc(row, text, model, kind):
     parent = row['parent']
     identifier = row['id'] + (
@@ -1606,12 +1642,9 @@ def output_doc(row, text, model, kind):
         },
         media_sha256=row['media_sha256'],
     )
-    if 'pages_read' in row:
-        doc['pages'] = dict(
-            covered=row['pages_read'],
-            total=row.get('total_pages'),
-            requested=row.get('pages_requested'),
-        )
+    pages = pages_view(row)
+    if pages is not None:
+        doc['pages'] = pages
     if row['ref']['source'] == 'link':
         doc['link'] = row['ref']['url']
         doc['title'] = row.get('metadata', {}).get('title') or title
@@ -1871,6 +1904,10 @@ TRANSIENT_ERRNOS = frozenset(
 def temporary_refusal(error):
     if isinstance(error, (Failed, Unavailable)):
         return 'permanent', str(error)
+    if isinstance(error, StageFailed):
+        # A disk floor is a condition that passes; every other stage is this pipeline's own refusal.
+        kind = 'temporary' if error.stage == 'disk floor' else 'permanent'
+        return kind, f'stage_failed ({error.stage})'
     if isinstance(error, urllib.error.HTTPError):
         if error.code in (403, 451):
             return 'blocked', f'remote_blocked (HTTP {error.code})'
@@ -1897,6 +1934,11 @@ def temporary_refusal(error):
         kind = 'temporary' if name in TRANSIENT_ERRNOS else 'permanent'
         return kind, f'{type(error).__name__} {name} ({short})'
     return 'permanent', type(error).__name__
+
+
+def failure_line(row, kind):
+    """One journal line per failed attempt: which item, why, how it is treated, which try."""
+    return f'attachments: {row["id"]} {row["reason"]} {kind} attempt {row["attempts"]}'
 
 
 def next_attempt_at(row):
@@ -1953,6 +1995,7 @@ def process(home, row, step=lambda message: None, block=True):
                 row.pop('reason', None)
         except Exception as error:
             category, row['reason'] = temporary_refusal(error)
+            print(failure_line(row, category), file=sys.stderr)
             if category == 'temporary':
                 if row['attempts'] > len(RETRY_SCHEDULE):
                     row['state'] = 'failed'
@@ -2125,7 +2168,7 @@ def backfill(home, source):
     with ThreadPoolExecutor(max_workers=4) as pool:
         for offset in range(0, len(rows), 20):
             if shutil.disk_usage(home).free < 8 * 1024**3:
-                raise OSError('disk floor')
+                raise StageFailed('disk floor')
             batch = list(pool.map(lambda row: finish(home, row), rows[offset : offset + 20]))
             save(
                 home / 'attachments' / ('backfill-' + source + '.json'),
@@ -2247,7 +2290,7 @@ def rescue(home, days=45, dry_run=False, step=lambda message: None):
     for identifier in pending if not dry_run else []:
         try:
             if shutil.disk_usage(home).free < 8 * 1024**3:
-                raise OSError('disk floor')
+                raise StageFailed('disk floor')
             parent, _, ref = attachment_ref(home, identifier)
             enqueue(home, identifier, parent, ref, media_only=True, retry_failed=True)
             row = finish(home, {'id': identifier}, step) or {}

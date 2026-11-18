@@ -14,6 +14,7 @@
     "At least once: a version may be returned again after a restart; consumers dedupe on (id, version).",
     "--since-arrival T is exact for T at or after the arrival epoch (the first deploy of qmd.feed.v1; versions written earlier carry arrived null): it starts at the first version whose arrival is at or after T. A T before the epoch exits 2 naming the epoch; it never silently starts late.",
     "--after and --since-arrival are mutually exclusive; giving neither is a usage error (exit 2): a consumer always chooses its start.",
+    "Each item carries its own origin (steward, gsd, interactive; null off sessions), so a tombstone is filtered like the doc it removes.",
     "Under QMD_UNTIL, head is the newest position visible under the ceiling, so complete stays reachable for a replaying consumer."
   ],
   "type": "object",
@@ -75,6 +76,19 @@
               "null"
             ]
           },
+          "origin": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "enum": [
+              "steward",
+              "gsd",
+              "interactive",
+              null
+            ],
+            "description": "Session origin label carried by the version itself; null for non-session sources, and interactive for a session doc written before origins."
+          },
           "time": {
             "type": [
               "number",
@@ -115,6 +129,24 @@
               "null"
             ],
             "description": "Canonical WhatsApp chat (phone-number JID); null for other sources."
+          },
+          "where": {
+            "type": [
+              "array",
+              "string",
+              "null"
+            ],
+            "items": {
+              "type": "string"
+            },
+            "description": "The doc's location labels where the source carries them as a list (Instapaper folder: unread|archive|starred; Gmail label ids), else the doc's single location string (calendar location, file or repo path, session project); null where the doc carries none."
+          },
+          "bookmarked": {
+            "type": [
+              "boolean",
+              "null"
+            ],
+            "description": "The X viewer state of the post this version captured: true while it is a save, false once it is not, null where the source has no such flag."
           },
           "version": {
             "type": "string",

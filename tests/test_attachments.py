@@ -87,7 +87,7 @@ def test_extraction_output_reparse_chain(tmp_path, source, kind, total):
     parsed = parse(raw, {'key': identifier})[0]
     assert parsed['parser'] == 'attachment@2'
     assert parsed['model'] == 'synthetic-model' and parsed['pipeline_revision'] == 3
-    assert parsed['pages'] == dict(covered=2, total=total, requested=2)
+    assert parsed['pages'] == dict(covered=2, total=total, requested=2, azure=2)
     assert 'Model:' not in render(parsed) and 'pipeline revision:' not in text(parsed)
     assert 'User supplied heading' in render(parsed)
     assert ('Extracted 2 of' in render(parsed)) == (total != 2)

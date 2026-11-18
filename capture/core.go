@@ -6,12 +6,15 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -244,6 +247,30 @@ func loadEnv(paths []string) (map[string]string, error) {
 	}
 	return out, nil
 }
+
+// transportClass names a client.Do failure by kind, so a red lane says which fault it met.
+func transportClass(err error) string {
+	var netErr net.Error
+	var dnsErr *net.DNSError
+	var recordErr tls.RecordHeaderError
+	var verifyErr *tls.CertificateVerificationError
+	var authorityErr x509.UnknownAuthorityError
+	var hostnameErr x509.HostnameError
+	var invalidErr x509.CertificateInvalidError
+	switch {
+	case errors.Is(err, context.DeadlineExceeded) || (errors.As(err, &netErr) && netErr.Timeout()):
+		return "timeout"
+	case errors.As(err, &dnsErr):
+		return "dns"
+	case errors.Is(err, syscall.ECONNREFUSED):
+		return "refused"
+	case errors.Is(err, syscall.ECONNRESET), errors.Is(err, io.EOF), errors.Is(err, io.ErrUnexpectedEOF):
+		return "reset"
+	case errors.As(err, &recordErr), errors.As(err, &verifyErr), errors.As(err, &authorityErr), errors.As(err, &hostnameErr), errors.As(err, &invalidErr):
+		return "tls"
+	}
+	return "other"
+}
 func (r *run) request(ctx context.Context, method, endpoint string, headers map[string]string, body []byte) ([]byte, int, error) {
 	for attempt := 0; attempt < 2; attempt++ {
 		req, e := http.NewRequestWithContext(ctx, method, endpoint, bytes.NewReader(body))
@@ -255,10 +282,13 @@ func (r *run) request(ctx context.Context, method, endpoint string, headers map[
 		}
 		resp, e := r.client.Do(req)
 		if e != nil {
-			if attempt == 0 && ctx.Err() == nil {
+			if ctx.Err() != nil {
+				return nil, 0, errors.New("request deadline reached")
+			}
+			if attempt == 0 {
 				continue
 			}
-			return nil, 0, errors.New("provider transport failed")
+			return nil, 0, fmt.Errorf("provider transport failed (%s)", transportClass(e))
 		}
 		status := resp.StatusCode
 		b, e := io.ReadAll(io.LimitReader(resp.Body, 64<<20+1))

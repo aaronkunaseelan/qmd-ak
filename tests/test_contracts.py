@@ -7,7 +7,7 @@ import shutil
 import time
 
 from qmd2.ingestd import Ingestd
-from qmd2.sources import SOURCES
+from qmd2.sources import SOURCES, kill_timeout
 from qmd2.verify import lateness_limit
 
 
@@ -32,6 +32,48 @@ def test_status_contract_rejects_extra_key_when_closed(tmp_path):
         )
         assert result.returncode == int(extra), result.stdout
         assert result.stdout == ('$.unexpected: unexpected\n' if extra else 'valid\n')
+
+
+def test_feed_contract_declares_bookmarked_subprocess(tmp_path):
+    """The shipped feed contract declares the X bookmark flag, so a consumer may read it."""
+    shipped = Path(__file__).parents[1] / 'qmd2/contracts/qmd.feed.v1.json'
+    contract = tmp_path / 'feed.json'
+    contract.write_text(shipped.read_text())
+    item = dict(
+        token='qmd1.x.' + '0' * 20 + '.' + '0' * 20,
+        id='x:synthetic:42',
+        item='x:synthetic:42',
+        source='x',
+        kind='post',
+        time=1791849600,
+        arrived=1791849600,
+        title=None,
+        **{'from': '@synthetic'},
+        thread=None,
+        chat=None,
+        where=None,
+        version='synthetic',
+        tombstone=False,
+        reparse=False,
+    )
+    validator = Path(__file__).with_name('validate.py')
+    for bookmarked in (True, False, None, 'absent'):
+        row = item if bookmarked == 'absent' else dict(item, bookmarked=bookmarked)
+        payload = dict(
+            schema='qmd.feed.v1',
+            source='x',
+            items=[row],
+            next=None,
+            head=None,
+            complete=True,
+        )
+        result = subprocess.run(
+            [sys.executable, '-I', str(validator), str(contract)],
+            input=json.dumps(payload),
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0, (bookmarked, result.stdout)
 
 
 def test_validator_numeric_boundaries_subprocess(tmp_path):
@@ -65,10 +107,10 @@ def test_currency_expiry_filesystem(tmp_path, monkeypatch):
 
     monkeypatch.setattr(time, 'time', lambda: 10000)
     for cadence, fresh, expiry, current in (
-        (15, 6400, 10000, True),
-        (15, 6399, 9999, False),
-        (15, 6401, 10001, True),
-        (86400, 6400, 179200, True),
+        (15, 6400, 10300, True),
+        (15, 6099, 9999, False),
+        (15, 6401, 10301, True),
+        (86400, 6400, 179500, True),
         (15, None, None, None),
         (0, 10000, None, None),
         (None, 10000, None, None),
@@ -79,6 +121,23 @@ def test_currency_expiry_filesystem(tmp_path, monkeypatch):
         row = view(tmp_path, json.loads(path.read_text()))['sources']['synthetic']
         assert row['valid_until'] == expiry
         assert row['current'] is current
+
+
+def test_one_failed_run_stays_current_until_its_retry_ends(tmp_path, monkeypatch):
+    from qmd2.status import view
+
+    cadence, timeout, start = 7200, kill_timeout('x'), 100000
+    for elapsed, current in (
+        (2 * cadence + 60, True),
+        (2 * cadence + timeout + 1, False),
+    ):
+        monkeypatch.setattr(time, 'time', lambda: start + elapsed)
+        path = tmp_path / 'status.json'
+        path.write_text(
+            json.dumps(dict(sources={'x': dict(cadence_s=cadence, fresh_through=start)}))
+        )
+        row = view(tmp_path, json.loads(path.read_text()))['sources']['x']
+        assert row['current'] is current, elapsed
 
 
 def test_status_contract_filesystem_cli(tmp_path):
@@ -126,7 +185,7 @@ def test_status_contract_filesystem_cli(tmp_path):
     assert cli('search', 'lighthouse', '--json')
     assert 'synthetic lighthouse' in cli('get', 'pi:synthetic#one')
     for source, row in payload['sources'].items():
-        assert row['limit_s'] == lateness_limit(row['cadence_s'])
+        assert row['limit_s'] == lateness_limit(row['cadence_s'], kill_timeout(source))
         assert row['current'] is None and row['error'] is None
         assert row['valid_until'] is None
         if source in snapshot['sources']:

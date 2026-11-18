@@ -73,7 +73,10 @@ func runX(ctx context.Context, r *run) error {
 	if e := r.xContexts(ctx, binary, preload, &remaining, c); e != nil {
 		return e
 	}
-	return r.xHistory(ctx, binary, preload, &remaining, c)
+	if e := r.xHistory(ctx, binary, preload, &remaining, c); e != nil {
+		return e
+	}
+	return r.xBookmarks(ctx, binary, preload, &remaining, c)
 }
 
 func (r *run) birdCommand(ctx context.Context, binary, preload string, remaining *int, args ...string) ([]byte, error) {
@@ -168,12 +171,19 @@ func (r *run) xCommit(c *xCursor) error {
 	return r.save()
 }
 
-func (r *run) xPage(ctx context.Context, binary, preload string, remaining *int, list int, cursor string, head bool) (string, bool, error) {
+// One listing page: the cursor to continue from, its post ids and whether any post's digest changed.
+type xListPage struct {
+	Next    string
+	IDs     []string
+	Changed bool
+}
+
+func (r *run) xPage(ctx context.Context, binary, preload string, remaining *int, list int, cursor string, head bool) (*xListPage, error) {
 	args := []string{"--plain"}
 	if xLists[list] == "tweets" {
 		username := r.env["QMD_X_USERNAME"]
 		if username == "" {
-			return "", false, errors.New("QMD_X_USERNAME required (or --x-username)")
+			return nil, errors.New("QMD_X_USERNAME required (or --x-username)")
 		}
 		args = append(args, "user-tweets", username)
 	} else {
@@ -185,21 +195,21 @@ func (r *run) xPage(ctx context.Context, binary, preload string, remaining *int,
 	}
 	b, e := r.birdCommand(ctx, binary, preload, remaining, args...)
 	if e != nil {
-		return "", false, e
+		return nil, e
 	}
 	var page struct {
 		Tweets []json.RawMessage `json:"tweets"`
 		Next   string            `json:"nextCursor"`
 	}
 	if json.Unmarshal(b, &page) != nil || page.Tweets == nil {
-		return "", false, errors.New("bird page invalid")
+		return nil, errors.New("bird page invalid")
 	}
+	out := &xListPage{Next: page.Next}
 	writtenBefore := r.receipt.Written
-	changed := false
 	for _, raw := range page.Tweets {
 		var post map[string]any
 		if json.Unmarshal(raw, &post) == nil {
-			changed = changed || r.state.Hashes[xString(post, "id")] != xTweetDigest(post)
+			out.Changed = out.Changed || r.state.Hashes[xString(post, "id")] != xTweetDigest(post)
 		}
 		if head && r.xstate != nil {
 			var tweet struct {
@@ -215,13 +225,15 @@ func (r *run) xPage(ctx context.Context, binary, preload string, remaining *int,
 			}
 		}
 		if e := r.xTweet(raw); e != nil {
-			return "", false, e
+			return nil, e
 		}
+		out.IDs = append(out.IDs, xString(post, "id"))
 	}
 	if page.Next != "" && page.Next == cursor {
-		return "", false, errors.New("bird repeated cursor")
+		return nil, errors.New("bird repeated cursor")
 	}
-	return page.Next, changed || r.receipt.Written != writtenBefore, nil
+	out.Changed = out.Changed || r.receipt.Written != writtenBefore
+	return out, nil
 }
 
 func xTweetDigest(tweet map[string]any) string {
@@ -314,17 +326,17 @@ func (r *run) xHeads(ctx context.Context, binary, preload string, remaining *int
 
 func (r *run) xHead(ctx context.Context, binary, preload string, remaining *int, c *xCursor, interrupted bool) error {
 	for {
-		next, changed, err := r.xPage(ctx, binary, preload, remaining, c.Head.List, c.Head.Cursor, true)
+		page, err := r.xPage(ctx, binary, preload, remaining, c.Head.List, c.Head.Cursor, true)
 		if err != nil {
 			return err
 		}
 		// The interrupted page may contain hashes emitted before its failure.
-		if next == "" || (!changed && !interrupted) {
+		if page.Next == "" || (!page.Changed && !interrupted) {
 			c.Head = nil
 			return r.xCommit(c)
 		}
 		interrupted = false
-		c.Head.Cursor = next
+		c.Head.Cursor = page.Next
 		if err := r.xCommit(c); err != nil {
 			return err
 		}
@@ -335,15 +347,15 @@ func (r *run) xHistory(ctx context.Context, binary, preload string, remaining *i
 	r.receipt.HeadComplete = true
 	for !c.Backfill.Done && *remaining > 0 {
 		failedBefore := r.receipt.Failed
-		next, _, err := r.xPage(ctx, binary, preload, remaining, c.Backfill.List, c.Backfill.Cursor, false)
+		page, err := r.xPage(ctx, binary, preload, remaining, c.Backfill.List, c.Backfill.Cursor, false)
 		if err != nil {
 			r.receipt.Enumerated -= r.receipt.Failed - failedBefore
 			r.receipt.Failed = failedBefore
 			r.receipt.BackfillError = err.Error()
 			break
 		}
-		c.Backfill.Cursor = next
-		if next == "" {
+		c.Backfill.Cursor = page.Next
+		if page.Next == "" {
 			c.Backfill.List++
 			if c.Backfill.List == len(xLists) {
 				c.Backfill.List = 0
@@ -357,16 +369,106 @@ func (r *run) xHistory(ctx context.Context, binary, preload string, remaining *i
 	return r.xCommit(c)
 }
 
+const xBookmarksInterval = 24 * time.Hour
+
+// The bookmarks list is the only view of a save while it is a save; a post that leaves it stops appearing in any
+// list, so its doc would keep kind=bookmark forever. A walk of the whole list, at most once a day, is the one
+// place that removal becomes visible: the ids it saw settle in Bookmarks, and each id that left is queued for
+// the demand refresh that re-reads its live viewer flags. A walk cut short resumes from its cursor and decides
+// no removal; the first walk only seeds the set.
+func (r *run) xBookmarks(ctx context.Context, binary, preload string, remaining *int, c *xCursor) error {
+	if c.BookmarksWalk == nil && c.BookmarksWalkedAt.After(time.Now().Add(-xBookmarksInterval)) {
+		return nil
+	}
+	if c.BookmarksWalk == nil {
+		c.BookmarksWalk = &xBookmarkWalk{}
+		if err := r.xCommit(c); err != nil {
+			return err
+		}
+	}
+	for !c.BookmarksWalk.Done && *remaining > 0 {
+		page, err := r.xPage(ctx, binary, preload, remaining, 0, c.BookmarksWalk.Cursor, false)
+		if err != nil {
+			// The head scan already reports a provider failure; a short walk keeps its cursor for the next run.
+			break
+		}
+		c.BookmarksWalk.Seen = append(c.BookmarksWalk.Seen, page.IDs...)
+		c.BookmarksWalk.Cursor, c.BookmarksWalk.Done = page.Next, page.Next == ""
+		if err := r.xCommit(c); err != nil {
+			return err
+		}
+	}
+	if !c.BookmarksWalk.Done {
+		return nil
+	}
+	seen := make(map[string]bool, len(c.BookmarksWalk.Seen))
+	for _, id := range c.BookmarksWalk.Seen {
+		seen[id] = true
+	}
+	settled := append([]string{}, c.BookmarksWalk.Seen...)
+	for _, id := range c.Bookmarks {
+		if seen[id] {
+			continue
+		}
+		// The refresh merges the flags of the post its due entry carries, so the entry carries the live post and
+		// never the archived one. Only a provider answer that omits the post means it is gone and can drop out;
+		// any other failure keeps the id settled, so the next walk decides it again.
+		raw, err := r.xThread(ctx, binary, preload, remaining, id)
+		if errors.Is(err, errXPostGone) {
+			continue
+		}
+		if err != nil {
+			settled = append(settled, id)
+			continue
+		}
+		c.Due[id] = &xDue{At: time.Now(), Tweet: raw}
+	}
+	c.Bookmarks = settled
+	c.BookmarksWalkedAt = time.Now()
+	c.BookmarksWalk = nil
+	return r.xCommit(c)
+}
+
+// A provider answer that omits the post it was asked for means a deleted or protected post; nothing can refresh it.
+var errXPostGone = errors.New("x post gone: provider omitted focal post")
+
+// xThread reads one post through the single-post provider path, without context and without a write.
+func (r *run) xThread(ctx context.Context, binary, preload string, remaining *int, id string) (json.RawMessage, error) {
+	page, err := r.xFetch(ctx, binary, preload, remaining, "thread", id)
+	if err != nil {
+		return nil, err
+	}
+	for _, tweet := range page.Tweets {
+		if xString(tweet, "id") == id {
+			raw, _ := json.Marshal(tweet)
+			return raw, nil
+		}
+	}
+	return nil, errXPostGone
+}
+
 type xBackfill struct {
 	List   int    `json:"list"`
 	Cursor string `json:"cursor"`
 	Done   bool   `json:"done"`
 }
+
+// A full walk keeps its own cursor and the ids it has seen so far, so only a walk that reaches the list's end
+// replaces Bookmarks or decides a removal.
+type xBookmarkWalk struct {
+	Cursor string   `json:"cursor"`
+	Seen   []string `json:"seen"`
+	Done   bool     `json:"done"`
+}
+
 type xCursor struct {
-	Head     *xBackfill           `json:"head,omitempty"`
-	Backfill *xBackfill           `json:"backfill"`
-	Contexts map[string]*xContext `json:"contexts,omitempty"`
-	Due      map[string]*xDue     `json:"due,omitempty"`
+	Head              *xBackfill           `json:"head,omitempty"`
+	Backfill          *xBackfill           `json:"backfill"`
+	BookmarksWalk     *xBookmarkWalk       `json:"bookmarks_walk,omitempty"`
+	Bookmarks         []string             `json:"bookmarks,omitempty"`
+	BookmarksWalkedAt time.Time            `json:"bookmarks_walked_at"`
+	Contexts          map[string]*xContext `json:"contexts,omitempty"`
+	Due               map[string]*xDue     `json:"due,omitempty"`
 }
 
 // Post versions use normalized content; provider envelopes stay in archived payloads.

@@ -284,7 +284,7 @@ def test_extract_pages_sends_only_that_span(tmp_path, monkeypatch, capsys):
         code, payload = run_extract(capsys, str(source), '--json', '--pages', selection)
         assert code == 0, payload
         assert calls[0].endswith('prebuilt-layout:analyze?api-version=2024-11-30&pages=' + asked)
-        assert payload['pages'] == dict(covered=2, total=3, requested=requested)
+        assert payload['pages'] == dict(covered=2, total=3, requested=requested, azure=2)
         assert 'truncated' not in payload
         assert contract_exit(payload) == 0
 

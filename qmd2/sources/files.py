@@ -88,6 +88,8 @@ def excluded_path(path):
         return 'core_dump'
     if name.endswith(('-wal', '-shm', '-journal')):
         return 'sqlite_auxiliary'
+    if any(p == '.git' for p in parts):
+        return 'vcs'
     if any(p in DIRECTORIES or p.startswith('.venv') for p in parts[:-1]):
         return 'reconstructable'
     return None

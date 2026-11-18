@@ -162,7 +162,7 @@ func TestInstapaperPersistentHTTPSubprocess(t *testing.T) {
 		tries    int
 		healthy  bool
 		excluded bool
-	}{{"too_young", 5 * time.Hour, 9, true, false}, {"too_few_tries", 7 * time.Hour, 8, true, false}, {"outage", 7 * time.Hour, 9, false, false}, {"persistent", 6 * time.Hour, 9, true, true}} {
+	}{{"before_deadline", 30 * time.Minute, 9, true, false}, {"first_failure", 0, 1, true, false}, {"past_deadline", 2 * time.Hour, 9, true, true}, {"outage_past_deadline", 2 * time.Hour, 9, false, true}} {
 		t.Run(row.name, func(t *testing.T) {
 			testInstapaperPersistent(t, row.age, row.tries, row.healthy, row.excluded)
 		})
@@ -207,12 +207,12 @@ func testInstapaperPersistent(t *testing.T, age time.Duration, tries int, health
 	}
 	if !excluded {
 		if r.OK || r.Failed != 1 || r.Excluded != 0 || p.ExcludedReason != "" {
-			t.Fatal("threshold or outage guard failed")
+			t.Fatal("failure before the lane deadline must stay red")
 		}
 		return
 	}
-	if !r.OK || r.Failed != 0 || r.Excluded != 1 || r.ExclusionReasons["provider_persistent_http_504"] != 1 || len(r.FailedIDs) != 0 || !r.OldestFailed.IsZero() || time.Until(p.RetryAt) < 23*time.Hour {
-		t.Fatal("persistent exclusion invalid")
+	if !r.OK || r.Failed != 0 || r.Excluded != 1 || r.ExclusionReasons["text_timeout"] != 1 || len(r.FailedIDs) != 0 || !r.OldestFailed.IsZero() || time.Until(p.RetryAt) < 23*time.Hour {
+		t.Fatal("lane-deadline exclusion invalid")
 	}
 	checkIPPersistentRecovery(t, root, server.URL, path, &badStatus, &textRequests, cp, cursor)
 }
@@ -253,7 +253,7 @@ func checkIPPersistentRecovery(t *testing.T, root, endpoint, path string, badSta
 	cp.Cursor, _ = json.Marshal(cursor)
 	writeIPState(t, path, cp)
 	r = ipStateChild(t, root, endpoint, path, &cp, &cursor)
-	if !r.OK || r.Failed != 0 || r.Excluded != 1 || r.ExclusionReasons["provider_persistent_http_504"] != 1 {
+	if !r.OK || r.Failed != 0 || r.Excluded != 1 || r.ExclusionReasons["text_timeout"] != 1 {
 		t.Fatal("due transient daily retry must preserve its established exclusion")
 	}
 	before = textRequests.Load()
@@ -272,14 +272,126 @@ func checkIPPersistentRecovery(t *testing.T, root, endpoint, path string, badSta
 		t.Fatal("daily recovery did not replace exclusion")
 	}
 	index, _ := os.ReadFile(filepath.Join(spool, "index.jsonl"))
-	entries := splitLines(index)
-	if len(entries) != 3 {
-		t.Fatal("healthy article, exclusion and recovered article expected")
+	marker, recovered := false, false
+	for _, line := range splitLines(index) {
+		var entry SpoolEntry
+		json.Unmarshal(line, &entry)
+		if entry.Key == "1" {
+			marker = marker || entry.State.Labels["reason"] == "text_timeout"
+			recovered = recovered || entry.State.Labels["reason"] == ""
+		}
 	}
-	var marker, recovered SpoolEntry
-	json.Unmarshal(entries[1], &marker)
-	json.Unmarshal(entries[2], &recovered)
-	if marker.State.Labels["reason"] != "provider_persistent_http_504" || recovered.State.Labels["reason"] != "" {
-		t.Fatal("marker/recovery reason invalid")
+	if !marker || !recovered {
+		t.Fatal("exclusion marker and its recovery expected")
 	}
+}
+
+func TestInstapaperFolderMoveKeepsBookmark(t *testing.T) {
+	root := t.TempDir()
+	spool := filepath.Join(root, "spool")
+	var phase atomic.Int32
+	var archiveHave atomic.Value
+	phase.Store(1)
+	server := instapaperFolderMoveServer(&phase, &archiveHave)
+	defer server.Close()
+	first, code := ipTestChild(t, root, server.URL)
+	if code != 0 || !first.OK || first.Written != 1 || first.Failed != 0 || !first.HeadComplete {
+		t.Fatalf("first pass %+v", first)
+	}
+	path := filepath.Join(root, "state", "instapaper-"+digest([]byte("42"))[:16]+".json")
+	var saved checkpoint
+	var cursor ipCursor
+	readIPState(t, path, &saved, &cursor)
+	if cursor.Have["unread"]["7"] == "" || cursor.Have["archive"]["7"] != "" {
+		t.Fatal("first pass must file the bookmark under unread")
+	}
+	phase.Store(2)
+	second, code := ipTestChild(t, root, server.URL)
+	if code != 0 || !second.OK || second.Written != 1 || second.Failed != 0 {
+		t.Fatalf("folder move %+v", second)
+	}
+	readIPState(t, path, &saved, &cursor)
+	if _, ok := cursor.Have["unread"]["7"]; ok {
+		t.Fatal("delete_ids must drop the id from the folder it left")
+	}
+	entries := ipSpoolEntries(t, spool)
+	if len(entries) != 2 {
+		t.Fatalf("folder move emitted %d snapshots, want the two captures", len(entries))
+	}
+	moved := 0
+	for _, entry := range entries {
+		if entry.State.Labels["state"] != "" {
+			t.Fatalf("folder move emitted a delete notice: %v", entry.State.Labels)
+		}
+		if entry.Key == "7" && entry.State.Labels["folder"] == "archive" {
+			moved++
+		}
+	}
+	if moved != 1 {
+		t.Fatalf("moved bookmark captured %d times in archive, want 1", moved)
+	}
+	phase.Store(3)
+	third, code := ipTestChild(t, root, server.URL)
+	if code != 0 || !third.OK || third.Written != 0 || third.Enumerated != 0 {
+		t.Fatalf("settled pass %+v", third)
+	}
+	if have, _ := archiveHave.Load().(string); !strings.Contains(","+have+",", ",7,") {
+		t.Fatalf("settled archive listing did not carry the known id: have %q", have)
+	}
+	if after := ipSpoolEntries(t, spool); len(after) != len(entries) {
+		t.Fatalf("settled pass emitted %d snapshots, want none", len(after)-len(entries))
+	}
+}
+
+// instapaperFolderMoveServer lists bookmark 7 in unread, then answers the unread listing with a
+// delete_ids meta record while archive lists the same bookmark: the API's folder move.
+func instapaperFolderMoveServer(phase *atomic.Int32, archiveHave *atomic.Value) *httptest.Server {
+	// Archiving the bookmark updates its progress, so the archive record is a new payload.
+	const unread = `{"type":"bookmark","bookmark_id":7,"hash":"a","time":1791856800,"title":"Synthetic moved","progress":0}`
+	const archived = `{"type":"bookmark","bookmark_id":7,"hash":"a","time":1791856800,"title":"Synthetic moved","progress":1.0}`
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		req.ParseForm()
+		switch req.URL.Path {
+		case "/api/1/account/verify_credentials":
+			w.Write([]byte(`[{"type":"user","user_id":42}]`))
+		case "/api/1/bookmarks/list":
+			folder, have := req.Form.Get("folder_id"), req.Form.Get("have")
+			switch {
+			case folder == "unread" && phase.Load() == 1 && have == "":
+				w.Write([]byte(`[` + unread + `]`))
+			case folder == "unread" && phase.Load() == 2:
+				w.Write([]byte(`[{"type":"meta","delete_ids":"7"}]`))
+			case folder == "unread" && phase.Load() == 3:
+				w.Write([]byte(`[{"type":"meta","delete_ids":""}]`))
+			case folder == "archive" && phase.Load() == 2 && have == "":
+				w.Write([]byte(`[` + archived + `]`))
+			default:
+				if folder == "archive" {
+					archiveHave.Store(have)
+				}
+				w.Write([]byte(`[]`))
+			}
+		case "/api/1/bookmarks/get_text":
+			w.Write([]byte("<p>synthetic moved article</p>"))
+		default:
+			w.WriteHeader(404)
+		}
+	}))
+}
+
+func ipSpoolEntries(t *testing.T, spool string) []SpoolEntry {
+	t.Helper()
+	index, err := os.ReadFile(filepath.Join(spool, "index.jsonl"))
+	if err != nil {
+		return nil
+	}
+	var entries []SpoolEntry
+	for _, line := range splitLines(index) {
+		var entry SpoolEntry
+		if json.Unmarshal(line, &entry) != nil {
+			t.Fatal("spool entry invalid")
+		}
+		entries = append(entries, entry)
+	}
+	return entries
 }

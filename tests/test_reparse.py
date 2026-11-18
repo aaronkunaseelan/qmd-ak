@@ -425,3 +425,59 @@ def test_reparse_raw_only_winners_and_any_raw_keeps_id(tmp_path):
         assert daemon.index.search('lighthouse')[0]['version'] == hit['version']
         assert daemon.index.lookup('gmail:synthetic:empty') is None
         assert daemon.state.get('epoch:gmail') == 1
+
+
+def test_instapaper_reparse_restores_archived(tmp_path):
+    daemon = Ingestd(tmp_path, remote=False)
+    ctx = {'account': 'synthetic', 'key': '42', 'time': '2026-10-13T00:00:00Z'}
+    snapshot = json.dumps(
+        {
+            'bookmark': {
+                'bookmark_id': 42,
+                'title': 'Synthetic article',
+                'time': 1791849600,
+                'url': 'https://example.test',
+            },
+            'html': '<p>synthetic lighthouse</p>',
+        }
+    ).encode()
+    daemon.record('instapaper', snapshot, dict(ctx, folder='unread'), capture=100)
+    notice = json.dumps({'bookmark_id': 42, 'state': 'deleted'}).encode()
+    daemon.record('instapaper', notice, dict(ctx, state='deleted'), capture=200)
+    daemon.commit()
+    id = 'instapaper:synthetic:42'
+    assert daemon.index.lookup(id)['kind'] == 'article'
+    while not daemon.reindex('instapaper', seconds=0.000001):
+        pass
+    assert daemon.index.lookup(id)['kind'] == 'article'
+    assert daemon.index.search('lighthouse')[0]['id'] == id
+    assert not [
+        json.loads(body)['kind']
+        for pack in daemon.state.packs('doc')
+        for _, _, body in daemon.packs.iter_pack(pack)
+        if json.loads(body)['id'] == id and json.loads(body)['kind'] == 'tombstone'
+    ]
+
+
+def test_instapaper_reparse_keeps_folder_where(tmp_path):
+    snapshot = json.dumps(
+        {
+            'bookmark': {'bookmark_id': 42, 'time': 1791849600},
+            'html': '<p>synthetic lighthouse</p>',
+        }
+    ).encode()
+    ctx = {'account': 'synthetic', 'key': '42', 'time': '2026-10-13T00:00:00Z'}
+    for name, labels in (('folder', {'folder': 'archive'}), ('only', {'archive_only': 'true'})):
+        daemon = Ingestd(tmp_path / name, remote=False)
+        daemon.record('instapaper', snapshot, dict(ctx, **labels), capture=100)
+        daemon.commit()
+        id = 'instapaper:synthetic:42'
+
+        def where():
+            loc = daemon.index.lookup(id)['pointer']
+            return json.loads(daemon.packs.read(loc)[1]).get('where')
+
+        first = where()
+        while not daemon.reindex('instapaper', seconds=0.000001):
+            pass
+        assert first == ['archive'] and where() == first

@@ -72,7 +72,8 @@ from qmd2.sources.files import Walker, parse, publication, capture_file
             'authored',
             'nested.name: lighthouse\nports[0]: 80\nports[1]: 443',
         ),
-        ('.git/config', b'lighthouse', 10, None, 'no_row', None),
+        ('.git/config', b'lighthouse', 10, 'vcs', 'no_row', None),
+        ('repo/.git/objects/ab/cdef', b'\x00', 1, 'vcs', 'no_row', None),
         *[
             (name, b'synthetic', 9, excluded, None, None)
             for name, excluded in (
@@ -175,6 +176,30 @@ def test_parser_table(name, raw, size, excluded, kind, text):
         )
         == []
     )
+
+
+def test_walk_skips_git_internals(tmp_path, monkeypatch):
+    """A `.git` component names a repository, not files to capture."""
+    from qmd2.ingestd import Ingestd
+    from qmd2.sources.files import excluded_path
+
+    assert excluded_path('.git/config') == 'vcs'
+    assert excluded_path('repo/.git') == 'vcs'
+    assert excluded_path('repo/.git/objects/ab/cdef') == 'vcs'
+    monkeypatch.setenv('HOME', str(tmp_path))
+    root = tmp_path / 'workbench' / 'synthetic'
+    repo = root / 'repo'
+    repo.mkdir(parents=True)
+    subprocess.run(['git', 'init', '-q', str(repo)], check=True)
+    (repo / 'note.md').write_text('synthetic lighthouse note')
+    (repo / '.git' / 'synthetic-object').write_text('synthetic git internals')
+    daemon = Ingestd(tmp_path / 'store', remote=False)
+    _walk_files(daemon, root)
+    assert set(daemon.checkpoint('files:synthetic')) == {'repo/note.md'}
+    assert daemon.checkpoint('receipt:files')['ok']
+    assert daemon.index.search('lighthouse')
+    assert daemon.index.search('internals') == []
+    assert daemon.index.lookup('file:synthetic:repo/.git/synthetic-object') is None
 
 
 def test_files_chain_and_failed_root(tmp_path, monkeypatch):
@@ -381,8 +406,7 @@ def _files_sqlite(daemon, tmp_path, root):
     connection.commit()
     _walk_files(daemon, root)
     assert not daemon.index.lookup('file:synthetic:.git/config')
-    result = subprocess.run([*argv, 'file:synthetic:.git/config', '--raw'], capture_output=True)
-    assert result.returncode == 0 and result.stdout == b'synthetic git bytes'
+    assert '.git/config' not in daemon.checkpoint('files:synthetic')
     before = database.stat().st_mtime_ns
     connection.execute("INSERT INTO notes VALUES ('synthetic second')")
     connection.commit()

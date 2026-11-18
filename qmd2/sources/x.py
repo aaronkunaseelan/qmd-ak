@@ -16,6 +16,7 @@ def parse(raw, ctx):
         source='x',
         group='articles',
         kind='post',
+        bookmarked=False,
         time=None,
         parts=[],
         parser=f'x@{PARSER_VERSION}',
@@ -116,7 +117,9 @@ def _post(doc, row, ctx):
     if isinstance(row.get('tweet'), dict):
         row = row['tweet']
     viewer = (row.get('_raw') or {}).get('legacy') or {}
-    if row.get('bookmarked', viewer.get('bookmarked')) or saved == 'bookmark':
+    bookmarked = bool(row.get('bookmarked', viewer.get('bookmarked')) or saved == 'bookmark')
+    doc['bookmarked'] = bookmarked
+    if bookmarked:
         doc['kind'] = 'bookmark'
     elif row.get('favorited', viewer.get('favorited')) or saved == 'like':
         doc['kind'] = 'like'

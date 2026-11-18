@@ -20,7 +20,6 @@ BLOCKED = [
     '192.168.1.7',
     '169.254.169.254',
     '100.64.0.1',
-    '100.71.208.65',
     '240.0.0.1',
     '::1',
     'fd7a:115c:a1e0::1',
@@ -74,7 +73,7 @@ def test_non_http_schemes_are_refused():
 
 
 def test_a_fetch_refuses_before_it_connects(tmp_path, monkeypatch):
-    address_for(monkeypatch, {'intranet.example': '100.71.208.65'})
+    address_for(monkeypatch, {'intranet.example': '100.64.0.1'})
     monkeypatch.setattr(socket, 'socket', lambda *args, **kwargs: pytest.fail('connected'))
     row = dict(ref=dict(source='link', url='http://intranet.example:8180/health'))
     with pytest.raises(attachments.Unavailable, match='blocked_address'):
@@ -100,7 +99,7 @@ def test_a_queued_link_to_an_internal_name_ends_unavailable(tmp_path, monkeypatc
 
 
 def test_extract_refuses_internal_urls(tmp_path):
-    for url in ('http://127.0.0.1:8384/', 'http://100.71.208.65:8180/health'):
+    for url in ('http://127.0.0.1:8384/', 'http://100.64.0.1:8180/health'):
         result = subprocess.run(
             [
                 sys.executable,
