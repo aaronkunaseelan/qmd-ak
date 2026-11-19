@@ -168,12 +168,16 @@ class Ingestd:
         self.heavy_lock = None
         self.visible_index = None
         self.rebuild_on_start = False
+        resume = False
         if self.maintenance and not self.maintenance['source']:
             if self.maintenance['stage'] == 'swap':
                 self.swap_rebuild()
             else:
+                # A full rebuild that is still owed (an earlier start failed on the old schema):
+                # resume it from its cursor, once per start.
                 self.visible_index = Index(self.home)
                 self.index = Index(self.home, True, self.state, self.home / 'index-rebuild')
+                self.rebuild_on_start = resume = True
         else:
             try:
                 self.index = Index(self.home, True, self.state)
@@ -212,7 +216,8 @@ class Ingestd:
         self.reindex_doc_id = None
         self.migrate_session_origin()
         if self.rebuild_on_start:
-            self.start_reindex(None)
+            if not resume:
+                self.start_reindex(None)
             request = self.home / 'reindex.request'
             if not request.exists():
                 atomic(
@@ -223,7 +228,7 @@ class Ingestd:
                         'reset': False,
                     },
                 )
-            print('index: schema changed, full rebuild started', file=sys.stderr, flush=True)
+            print('index: schema changed, full rebuild requested', file=sys.stderr, flush=True)
 
     def checkpoint(self, key, default=None):
         if key not in self.checkpoints:
@@ -1544,13 +1549,32 @@ class Ingestd:
                 },
             )
             if self.visible_index is not None:
-                self.index.writer.wait_merging_threads()
-                del self.index
-                self.visible_index = None
-                self.index = Index(self.home, True, self.state)
-            self.maintenance = None
-            self.reparse_seen.clear()
-            self.queue_checkpoint('maintenance', None)
+                try:
+                    index = Index(self.home, True, self.state)
+                except ValueError:
+                    # A failed full rebuild left home/index on the old schema, so it cannot be
+                    # reopened writable. Keep the rebuild writer and the maintenance job as they
+                    # are, so every maintenance guard still sees a rebuild in progress and reads
+                    # come from the old index; the request goes, so this process does not retry and
+                    # the next start resumes the rebuild once.
+                    print(
+                        f'index: schema rebuild failed ({type(e).__name__}); '
+                        'serving the old index read-only until restart',
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                else:
+                    self.index.writer.wait_merging_threads()
+                    del self.index
+                    self.index = index
+                    self.visible_index = None
+                    self.maintenance = None
+                    self.reparse_seen.clear()
+                    self.queue_checkpoint('maintenance', None)
+            else:
+                self.maintenance = None
+                self.reparse_seen.clear()
+                self.queue_checkpoint('maintenance', None)
             self.commit()
         path.unlink(missing_ok=True)
         self.heavy_lock.close()

@@ -770,6 +770,142 @@ def test_filesystem_subprocess_tail_spool_and_cli(tmp_path):
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
 
 
+def without_origin_index(store, rows=()):
+    """home/index with the pre-origin schema: a writable open raises ValueError."""
+    import datetime
+    import shutil
+
+    import tantivy
+
+    shutil.rmtree(store / 'index', ignore_errors=True)
+    (store / 'index').mkdir()
+    builder = tantivy.SchemaBuilder()
+    for name in ('id', 'item', 'source', 'group', 'kind'):
+        builder.add_text_field(name, stored=True, tokenizer_name='raw')
+    builder.add_date_field('time', stored=True, fast=True)
+    for name in ('title', 'from', 'context', 'body'):
+        builder.add_text_field(name, stored=True)
+    for name in ('pointer', 'version'):
+        builder.add_text_field(name, stored=True, index_option='basic', tokenizer_name='raw')
+    index = tantivy.Index(builder.build(), path=str(store / 'index'))
+    writer = index.writer(heap_size=50_000_000, num_threads=1)
+    for row in rows:
+        writer.add_document(
+            tantivy.Document.from_dict(
+                {
+                    'title': 'old',
+                    'from': 'synthetic',
+                    'context': '',
+                    'pointer': json.dumps(
+                        dict(stream='doc', source=row['source'], seq=0, rec_off=0, rec_len=1)
+                    ),
+                    'version': json.dumps(
+                        {'capture': 1, 'time': '2026-10-13T01:00:00Z', 'hash': 'x'}
+                    ),
+                    **row,
+                    'time': datetime.datetime(2026, 10, 13, 1, 0, 0),
+                },
+                index.schema,
+            )
+        )
+    writer.commit()
+    del writer
+
+
+def test_a_failed_schema_rebuild_stays_a_rebuild(tmp_path, monkeypatch):
+    """Rebuild raises over an old-schema index: no request, no wrong outcome, no crash."""
+    from qmd2.ingestd import Ingestd
+    from qmd2.packs import Packs
+    from qmd2.state import State
+
+    monkeypatch.setattr('qmd2.ingestd.LEASE', tmp_path / 'heavy.lock')
+    store = tmp_path / 'store'
+    daemon = Ingestd(store, remote=False)
+    close_daemon(daemon)
+    writable = State(store, True)
+    corrupt = Packs(writable, writable=True)
+    corrupt.append('doc', 'pi', {'id': 'pi:synthetic#broken'}, b'{"id":"pi:synthetic#broken"}')
+    corrupt.sync()
+    writable.commit()
+    writable.db.close()
+    # The old index holds the parent of an attachment whose outcome is still pending.
+    parent = 'wa:synthetic:chat:7'
+    without_origin_index(
+        store,
+        [
+            dict(
+                id=parent,
+                item=parent,
+                source='whatsapp',
+                group='mail',
+                kind='message',
+                body='Synthetic parent',
+            )
+        ],
+    )
+    attachment = parent + '/att/0'
+    pending = store / 'attachments/pending'
+    pending.mkdir(parents=True)
+    queued = pending / (hashlib.sha256(attachment.encode()).hexdigest() + '.json')
+    queued.write_text(
+        json.dumps(
+            dict(
+                id=attachment,
+                state='done',
+                parent=dict(
+                    id=parent, source='whatsapp', group='mail', time='2026-10-13T00:59:00Z'
+                ),
+                ref=dict(source='whatsapp', type='image'),
+                automatic=False,
+                enqueued_at=1.0,
+                ended_at=2.0,
+                pipeline_revision=1,
+                output=dict(
+                    id=attachment + '/ocr',
+                    item=attachment,
+                    source='whatsapp',
+                    group='mail',
+                    kind='ocr',
+                    time='2026-10-13T01:00:00Z',
+                    parts=[dict(kind='attachment_text', text='Synthetic harbour label')],
+                    context=dict(parent=parent),
+                    pipeline_revision=1,
+                ),
+            )
+        )
+    )
+
+    daemon = Ingestd(store, remote=False)
+    try:
+        assert daemon.rebuild_on_start and (store / 'reindex.request').exists()
+        daemon.request(seconds=60)
+        # The rebuild died on the record without a source; it stays owed, so nothing looks normal.
+        assert not (store / 'reindex.request').exists()
+        assert daemon.maintenance is not None and daemon.visible_index is not None
+        assert daemon.maintenance['source'] is None and daemon.maintenance['stage'] == 'read'
+        result = json.loads((store / 'reindex.result').read_text())
+        assert result['ok'] is False and result['exception_class'] == 'KeyError'
+        # Nothing left to drive: a further turn writes nothing and retries nothing.
+        daemon.request(seconds=60)
+        assert json.loads((store / 'reindex.result').read_text()) == result
+        # An owed rebuild defers attachment outcomes: no parent_unavailable, the row is untouched.
+        records = daemon.stats['records']
+        daemon.attachment_outcomes(seconds=5)
+        daemon.commit()
+        assert daemon.stats['records'] == records
+        assert queued.exists() and 'migration_error' not in json.loads(queued.read_text())
+    finally:
+        close_daemon(daemon)
+        del daemon
+    # The next start resumes the owed rebuild instead of dying on the old index.
+    daemon = Ingestd(store, remote=False)
+    try:
+        assert (store / 'reindex.request').exists()
+        assert daemon.maintenance['source'] is None and daemon.visible_index is not None
+    finally:
+        close_daemon(daemon)
+
+
 def session_line(n, text='origin synthetic', session='c', project='/synthetic'):
     return (
         json.dumps(

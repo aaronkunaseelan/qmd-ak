@@ -191,7 +191,7 @@ class Repos:
         pairs, newest = tips(repo)
         run['head'] = max(run['head'], newest)
         stored = (daemon.checkpoint(key, {}) or {}).get('tips') or []
-        if stored and pairs == stored:
+        if pairs == stored:
             run['unchanged'] += 1
             return
         exclude = present(repo, sorted({sha for sha, _ in stored}))
@@ -202,13 +202,14 @@ class Repos:
                 argv += ['--not', *exclude]
             with bundle.open('wb') as output:
                 result = git(argv, repo, stdout=output)
-            if empty_bundle(result):
-                # No commit since the last record: nothing to capture, the same objects.
-                run['unchanged'] += 1
-                daemon.queue_checkpoint(key, {'tips': pairs, 'at': time.time()})
-                return
-            if result.returncode:
+            # A ref deleted or rewound since the last record leaves nothing to send: git refuses
+            # with "empty bundle" while the tips moved, so the new ref list is the whole record.
+            removal = empty_bundle(result)
+            if result.returncode and not removal:
                 raise OSError('git bundle failed')
+            if removal:
+                # git's refusal still writes a header; the record's bundle body is empty.
+                bundle.write_bytes(b'')
             size = bundle.stat().st_size
             if size > MAX_BYTES:
                 run['excluded'] += 1

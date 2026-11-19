@@ -59,15 +59,24 @@ def refs(repo):
     return dict(reversed(line.split(' ', 1)) for line in result.stdout.decode().splitlines())
 
 
-def restore(bundles, scratch):
+def restore(records, scratch):
+    """Fetch the chain in order, then set the refs to the last record's tips."""
     target = scratch / 'restore'
     subprocess.run(['git', 'init', '-q', '--bare', str(target)], check=True)
-    for bundle in bundles:
+    for meta, bundle in records:
+        if not bundle:
+            continue
         path = scratch / 'bundle'
         path.write_bytes(bundle)
         subprocess.run(
             ['git', '-C', str(target), 'fetch', '-q', str(path), '+refs/*:refs/*'], check=True
         )
+    wanted = {ref: sha for sha, ref in records[-1][0]['tips']}
+    for ref in refs(target):
+        if ref not in wanted:
+            git(target, 'update-ref', '-d', ref)
+    for ref, sha in wanted.items():
+        git(target, 'update-ref', ref, sha)
     return refs(target)
 
 
@@ -130,17 +139,7 @@ def test_bundle_chain_restores_the_source(tmp_path):
     assert daemon.checkpoint('repo:repo:synthetic:repo')['tips'] == second_meta['tips']
 
     # The chain of bundles restores the source repository's refs exactly.
-    restore = tmp_path / 'restore'
-    subprocess.run(['git', 'init', '-q', '--bare', str(restore)], check=True)
-    for bundle in (first, second):
-        path = tmp_path / 'bundle'
-        path.write_bytes(bundle)
-        subprocess.run(
-            ['git', '-C', str(restore), 'fetch', '-q', str(path), '+refs/*:refs/*'], check=True
-        )
-    source = git(repo, 'rev-parse', '--all').stdout.decode().split()
-    restored = git(restore, 'rev-parse', '--all').stdout.decode().split()
-    assert sorted(source) == sorted(restored) and len(source) == 2
+    assert restore([split(raw) for raw in stored], tmp_path) == refs(repo)
 
     # One document per record: the repo path as title, the ref list as body.
     doc = parse(stored[1], {})[0]
@@ -155,6 +154,22 @@ def test_bundle_chain_restores_the_source(tmp_path):
 
     # The tips are the durable record the next run reads back from the state store.
     assert daemon.state.get('repo:repo:synthetic:repo')['tips'] == second_meta['tips']
+
+    # A ref deleted with no new commit: an empty bundle, the new ref list as the record.
+    git(repo, 'branch', '-D', 'side')
+    run(lane, daemon)
+    stored = records(daemon)
+    assert len(stored) == 3
+    third_meta, third = split(stored[2])
+    assert third == b'' and third_meta['bundle_bytes'] == 0
+    assert [ref for _, ref in third_meta['tips']] == ['refs/heads/main']
+    assert daemon.checkpoint('receipt:repos')['written'] == 1
+    # Identical tips still write nothing.
+    run(lane, daemon)
+    assert len(records(daemon)) == 3
+    # Restoring sets the refs to the last record's tips, so the deletion replays.
+    assert restore([split(raw) for raw in stored], tmp_path) == refs(repo)
+    assert 'refs/heads/side' not in refs(repo)
 
 
 def test_a_vanished_tip_does_not_fail_the_lane(tmp_path):
@@ -191,10 +206,9 @@ def test_a_vanished_tip_does_not_fail_the_lane(tmp_path):
     assert [ref for _, ref in second_meta['tips']] == ['refs/heads/main']
 
     # The chain still restores every ref the source has now.
-    restored = restore([first, second], tmp_path)
+    restored = restore([split(raw) for raw in stored], tmp_path)
     source = refs(repo)
-    for ref, sha in source.items():
-        assert restored[ref] == sha
+    assert restored == source
 
 
 def test_repos_row_in_status_and_verify(tmp_path):
