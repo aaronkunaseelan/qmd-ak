@@ -83,7 +83,7 @@ Git internals are a repository, not files: any `.git` path component is excluded
 
 Search filters source/group/time, session origin and the caller's own session before candidate selection. It tries all-term matches first, then appends new any-term items if needed. Candidates are read in bounded 200-hit pages and reranked in Python by lexical score, bounded recency and kind weights, keeping one result per item. There are no vectors, embeddings, fusion tiers or model rerankers.
 
-A policy change rebuilds from doc packs. A parser change reparses raw packs with `reindex --reparse SOURCE`; a capture decode bug may require `--reset-source SOURCE`. Maintenance works in slices of at most 60 seconds per ingest turn, with capture between slices. A full rebuild writes a new index while ordinary readers retain the old index, then swaps at the tail; search can lag during this operation.
+A policy change rebuilds from doc packs. A parser change reparses raw packs with `reindex --reparse SOURCE`; a capture decode bug may require `--reset-source SOURCE`. For WhatsApp the reset also walks the raw packs and copies each archived original to the capture's `originals/`, which each capture run decodes again after the journal, without archiving it twice (D-181). Encrypted edits are decrypted from secrets the journal holds (D-182). Maintenance works in slices of at most 60 seconds per ingest turn, with capture between slices. A full rebuild writes a new index while ordinary readers retain the old index, then swaps at the tail; search can lag during this operation.
 
 ## 6. K6: Read contracts
 

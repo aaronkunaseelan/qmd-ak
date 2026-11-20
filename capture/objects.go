@@ -157,7 +157,7 @@ func waProcessObject(ctx context.Context, r *run, c *waCursor, row inventoryRow)
 	beforeFailed := r.receipt.Failed
 	b, e := inventoryBytes(ctx, r, row)
 	if e == nil {
-		e = waCaptureObject(ctx, r, c, b, row)
+		e = waCaptureObject(ctx, r, c, b, row, true)
 	}
 	if e != nil {
 		if ctx.Err() != nil {

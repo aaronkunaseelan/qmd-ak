@@ -8,6 +8,7 @@ import hashlib
 import io
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -440,7 +441,11 @@ class Ingestd:
             self.reindex_doc_id = doc['id']
             pointer = self.append_doc(source, doc, origin, capture, reparse=refresh or reparse)
             deferred = self.visible_index is not None
-            scoped = self.maintenance and self.maintenance['source'] == source
+            scoped = (
+                self.maintenance
+                and self.maintenance['source'] == source
+                and not self.maintenance.get('replay')
+            )
             if scoped:
                 self.reparse_seen.add(doc['id'])
             if not deferred and self.index.upsert(doc, pointer, refresh=refresh):
@@ -449,7 +454,7 @@ class Ingestd:
                 failures = self.checkpoint('parse_failures:' + source, 0)
                 self.queue_checkpoint('parse_failures:' + source, failures + 1)
                 self.queue_checkpoint('parse_failed_id:' + source, doc['id'])
-                if self.maintenance and self.maintenance['source'] == source and not refresh:
+                if scoped and not refresh:
                     self.maintenance['live_failures'] = self.maintenance.get('live_failures', 0) + 1
                     self.maintenance['live_failed_id'] = doc['id']
             if not deferred and doc['kind'] not in ('tombstone', 'attachment_outcome'):
@@ -1175,13 +1180,19 @@ class Ingestd:
         )
         self.queue_checkpoint('parse_failures:' + source, 0)
         self.queue_checkpoint('legacy:' + source, 0)
-        argv = next(argv for name, _, argv, _, *rest in SOURCES if name == source)
-        if argv and '--state' in argv:
-            path = Path(argv[argv.index('--state') + 1])
-            if not path.is_relative_to(self.home / 'capture-state'):
-                raise ValueError('capture state outside qmd2 home')
+        path = self.capture_state(source)
+        if path:
             shutil.rmtree(path, ignore_errors=True)
         self.commit()
+
+    def capture_state(self, source):
+        argv = next(argv for name, _, argv, _, *rest in SOURCES if name == source)
+        if not argv or '--state' not in argv:
+            return None
+        path = Path(argv[argv.index('--state') + 1])
+        if not path.is_relative_to(self.home / 'capture-state'):
+            raise ValueError('capture state outside qmd2 home')
+        return path
 
     def revive_reset(self, source):
         """Write again what a reset tombstoned: each id's last version, parsed from its raw."""
@@ -1239,15 +1250,16 @@ class Ingestd:
         self.index = Index(self.home, True, self.state)
         shutil.rmtree(old, ignore_errors=True)
 
-    def start_reindex(self, source, request=None):
+    def start_reindex(self, source, request=None, replay=False):
         self.commit()
         bounds = {}
-        if source:
+        if source and not replay:
             self.queue_checkpoint('indexed:' + source, {})
             receipt = dict(self.checkpoint('receipt:' + source, {}) or {})
             receipt.pop('searchable_through', None)
             self.queue_checkpoint('receipt:' + source, receipt)
             self.queue_checkpoint('epoch:' + source, self.checkpoint('epoch:' + source, 0) + 1)
+        if source:
             for row in self.state.packs('raw'):
                 if row['source'] == source:
                     frames = json.loads(row['frames']) if row['frames'] else None
@@ -1270,6 +1282,7 @@ class Ingestd:
             'contexts': {},
             'failures': 0,
             'failed_id': None,
+            'replay': replay,
         }
         self.reparse_seen = set()
         if not source:
@@ -1290,6 +1303,8 @@ class Ingestd:
 
     def reparse_raw(self, origin, head, raw, deadline):
         job, source = self.maintenance, self.maintenance['source']
+        if job.get('replay'):
+            return self.replay_original(source, origin, head, raw)
         native = head.get('version', {})
         native = native if isinstance(native, dict) else {}
         capture = native.get('capture', head.get('capture', 0))
@@ -1342,6 +1357,31 @@ class Ingestd:
                 )
         if docs:
             self.processed(source, native.get('item_time'))
+        return True
+
+    def replay_original(self, source, origin, head, raw):
+        """Hand an archived original back to its capture, which decodes it again after a reset.
+
+        Only `history:<sha256>` ids, named as capture reads them; a large original (no body in
+        the pack walk) streams from its pack. Owner bytes: directories 0700, files 0600."""
+        # The id names an original, whatever its head kind: the one-off import stored them as `raw`.
+        name = head.get('id', '').removeprefix('history:')
+        if not head.get('id', '').startswith('history:') or not re.fullmatch('[0-9a-f]{64}', name):
+            return True
+        # Older captures stored decoded records under such ids; only the named bytes are an original.
+        if head.get('sha256') != name:
+            return True
+        folder = self.capture_state(source)
+        folder.mkdir(mode=0o700, parents=True, exist_ok=True)
+        (folder / 'originals').mkdir(mode=0o700, exist_ok=True)
+        room(self.home, head['len'] if raw is None else len(raw))
+        temporary = folder / 'originals' / (name + '.tmp')
+        with os.fdopen(os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600), 'wb') as f:
+            if raw is None:
+                self.packs.write_raw(origin, f)
+            else:
+                f.write(raw)
+        os.replace(temporary, folder / 'originals' / name)
         return True
 
     def reparse_session_import(self, origin, head, raw, deadline, native, capture):
@@ -1458,7 +1498,7 @@ class Ingestd:
                 job['sealed_done'].append(key)
                 sealed_done.add(key)
         self.commit()
-        job['stage'] = 'tombstones' if source else 'swap'
+        job['stage'] = 'done' if job.get('replay') else 'tombstones' if source else 'swap'
         if not source:
             self.commit()
         if time.monotonic() >= deadline and worked:
@@ -1484,7 +1524,11 @@ class Ingestd:
             old = self.index.lookup(id)
             raw = old['version'].get('raw', {}) if old else {}
             bound = job['bounds'].get(str(raw.get('seq')), 0)
-            if old and raw.get('source') == source and raw.get('rec_off', 0) < bound:
+            # A version from before the source's reset was skipped, not reparsed: keep it, as the reset does.
+            kept = old and old['version'].get('capture', 0) < (
+                self.checkpoint('reset:' + source, 0) or 0
+            )
+            if old and not kept and raw.get('source') == source and raw.get('rec_off', 0) < bound:
                 doc = self.tombstone(source, old)
                 self.documents(source, [doc], raw, time.time_ns(), reparse=True)
             job['position'] += 1
@@ -1531,11 +1575,16 @@ class Ingestd:
         try:
             self.reindex_doc_id = None
             result = {'id': request['id'], 'ok': True}
-            if request.get('reset'):
+            if request.get('reset') and not self.maintenance:
                 self.reset_source(request['source'])
-            elif request.get('revive'):
+                # Children of archived originals are not in any capture input: replay them.
+                if request['source'] == 'whatsapp':
+                    self.start_reindex(request['source'], request, replay=True)
+            if request.get('revive'):
                 result['revived'] = self.revive_reset(request['source'])
-            elif not self.reindex(request.get('source'), seconds, request):
+            elif (self.maintenance or not request.get('reset')) and not self.reindex(
+                request.get('source'), seconds, request
+            ):
                 return
             atomic(self.home / 'reindex.result', result)
         except Exception as e:

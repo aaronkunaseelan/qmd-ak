@@ -91,6 +91,7 @@ type run struct {
 	state                                                                                                  checkpoint
 	receipt                                                                                                Receipt
 	client                                                                                                 *http.Client
+	waOriginals                                                                                            map[string]waOriginal // journal messages by id, read each run
 }
 
 func digest(b []byte) string { s := sha256.Sum256(b); return hex.EncodeToString(s[:]) }

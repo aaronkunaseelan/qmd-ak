@@ -123,7 +123,7 @@ func waGatherObjectPairs(b []byte, pairs map[string]string) error {
 	}
 	return nil
 }
-func waCaptureObject(ctx context.Context, r *run, c *waCursor, b []byte, row inventoryRow) error {
+func waCaptureObject(ctx context.Context, r *run, c *waCursor, b []byte, row inventoryRow, archive bool) error {
 	if e := ctx.Err(); e != nil {
 		return e
 	}
@@ -159,7 +159,7 @@ func waCaptureObject(ctx context.Context, r *run, c *waCursor, b []byte, row inv
 	if archivePairs != nil && len(archivePairs) == 0 {
 		archivePairs = update["aliases"].(map[string]string)
 	}
-	hash, e := waArchiveHistory(r, b, archivePairs, update)
+	hash, e := waArchiveHistory(r, b, archivePairs, update, archive)
 	if e != nil {
 		return e
 	}

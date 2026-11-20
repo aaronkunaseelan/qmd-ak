@@ -10,6 +10,7 @@ import subprocess
 import sys
 import time
 from datetime import datetime, timezone
+from pathlib import Path
 
 BOOKMARKS = {
     '1': ('Rewritten article', '<p>original lighthouse</p>', 'rewritten lighthouse'),
@@ -186,6 +187,10 @@ def test_reset_keeps_docs_capture_cannot_rewrite(tmp_path):
     assert code == 0 and 'Article text unavailable' in text and 'original harbor' not in text
     code, text = get(store, 'instapaper:synthetic:3')
     assert code == 0 and 'original beacon' in text
+    # A reparse after the reset skips pre-reset raws, so it keeps their docs too.
+    assert request(store, 'reparse', source='instapaper') == {'id': 'reparse', 'ok': True}
+    code, text = get(store, 'instapaper:synthetic:3')
+    assert code == 0 and 'original beacon' in text
 
 
 def test_revive_reset_writes_the_version_a_reset_tombstoned(tmp_path):
@@ -297,3 +302,106 @@ def test_revive_reset_does_not_report_a_clockless_tombstone(tmp_path):
     assert request(store, 'revive', source='instapaper', revive=True)['revived'] == []
     assert request(store, 'revive', source='instapaper', revive=True)['revived'] == []
     assert get(store, identifier)[0] != 0
+
+
+def test_reset_redecodes_an_archived_whatsapp_original(tmp_path):
+    """Chain: archived original → reset → real capture binary → spool → ingestd → get."""
+    store = tmp_path / '.local/share/qmd2'
+    capture = Path(__file__).parents[1] / 'capture'
+    fetch = tmp_path / 'qmd2-fetch'
+    subprocess.run(
+        ['go', 'build', '-o', str(fetch), './cmd/qmd2-fetch'],
+        cwd=capture,
+        env=dict(os.environ, GOPROXY='off'),
+        check=True,
+    )
+    sent = {'deviceSentMessage': {'message': {'conversation': 'synthetic lighthouse'}}}
+    row = {
+        'key': {'remoteJID': '8@s.whatsapp.net', 'ID': 'mine', 'fromMe': True},
+        'message': sent,
+        'messageTimestamp': str(ITEM_EPOCH),
+    }
+    chat = {'ID': '8@s.whatsapp.net', 'messages': [{'message': row}]}
+    history = {'syncType': 0, 'conversations': [chat]}
+    # Over 8 MiB, so the pack keeps it as a large record that the walk must stream.
+    pad = 'x' * (9 * 1024 * 1024)
+    original = json.dumps({'kind': 'history_sync', 'info': {'Data': history}, 'pad': pad}).encode()
+    name = hashlib.sha256(original).hexdigest()
+    bare = b'\x0a\x05hello'  # a bare protobuf Message: its identity is in no archive
+    info = {
+        'ID': 'received',
+        'Chat': '8@s.whatsapp.net',
+        'Timestamp': ITEM_EPOCH,
+        'IsFromMe': False,
+    }
+    received = json.dumps({'kind': 'message', 'info': info, 'proto_b64': 'CgdoYXJib3Vy'}).encode()
+    timestamp = datetime.fromtimestamp(ITEM_EPOCH, timezone.utc).isoformat()
+    # What an older decoder stored: the child of that original, with no text.
+    blank = {
+        'raw': {'history_sha256': name, 'ordinal': 0},
+        'decoded': {'id': 'mine', 'chat': '8@s.whatsapp.net', 'kind': 'message', 'from_me': True}
+        | {'timestamp': timestamp},
+    }
+    root = store / 'spool/whatsapp'
+    (root / 'objects').mkdir(parents=True)
+    spool(store, stamp(-3600), {'8@s.whatsapp.net:mine': (blank, {})}, source='whatsapp')
+    entries = []
+    bare_name = hashlib.sha256(bare).hexdigest()
+    # A key that is no sha256 name is never used as a path.
+    received_name = hashlib.sha256(received).hexdigest()
+    for key, body in (
+        ('history:' + name, original),
+        ('history:' + bare_name, bare),
+        ('history:' + received_name, received),
+        ('history:..', bare),
+        ('history:' + '0' * 64, bare),  # not the bytes its name says
+    ):
+        digest = hashlib.sha256(body).hexdigest()
+        (root / 'objects' / digest).write_bytes(body)
+        archive = {'archive_only': 'true', 'object_hash': digest, 'source': 'whatsapp'}
+        if body == received:  # as the one-off import stored originals: an ordinary `raw` record
+            archive = {}
+        entry = dict(
+            schema='qmd.spool-entry.v1',
+            source='whatsapp',
+            account='synthetic',
+            key=key,
+            path='objects/' + digest,
+            bytes=len(body),
+            sha256=digest,
+            state=dict(version='whatsapp-original-v1', labels=archive),
+            captured_at=stamp(-3600),
+        )
+        entries.append(json.dumps(entry) + '\n')
+    lines = (root / 'index.jsonl').read_text()
+    (root / 'index.jsonl').write_text(''.join(entries) + lines)
+    ingest(store)
+    identifier = 'wa:synthetic:8@s.whatsapp.net:mine'
+    code, text = get(store, identifier)
+    assert code == 0 and 'synthetic lighthouse' not in text
+
+    assert request(store, 'reset', source='whatsapp', reset=True) == {'id': 'reset', 'ok': True}
+    originals = store / 'capture-state/whatsapp/originals'
+    assert sorted(p.name for p in originals.parent.iterdir()) == ['originals']
+    assert sorted(p.name for p in originals.iterdir()) == sorted([name, bare_name, received_name])
+    assert (originals / name).read_bytes() == original
+    for path in (originals.parent, originals, originals / name):
+        assert path.stat().st_mode & 0o777 == (0o600 if path.is_file() else 0o700)
+    journal = tmp_path / 'journal'
+    journal.mkdir()
+    (journal / 'segment.jsonl').write_bytes(b'')
+    argv = [str(fetch), 'whatsapp', '--account', 'synthetic', '--journal', str(journal)]
+    argv += ['--spool', str(root), '--state', str(store / 'capture-state/whatsapp')]
+    argv += ['--env-file', str(tmp_path / 'absent.env')]
+    receipt = json.loads(subprocess.run(argv, capture_output=True, check=True).stdout)
+    assert receipt['ok'] and receipt['failed'] == 0
+    assert receipt['exclusion_reasons'] == {'original_without_identity': 1}
+    assert list(originals.iterdir()) == []
+    # The original is not archived again; its child comes back under the same id, with text.
+    keys = [json.loads(line)['key'] for line in (root / 'index.jsonl').read_text().splitlines()]
+    assert keys.count('history:' + name) == 1
+    ingest(store)
+    code, text = get(store, identifier)
+    assert code == 0 and 'synthetic lighthouse' in text
+    code, text = get(store, 'wa:synthetic:8@s.whatsapp.net:received')
+    assert code == 0 and 'harbour' in text

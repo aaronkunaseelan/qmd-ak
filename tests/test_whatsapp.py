@@ -14,6 +14,10 @@ CTX = {
     'contacts': {'8@s.whatsapp.net': 'Synthetic Sender'},
     'groups': {'9@g.us': 'Synthetic Group'},
 }
+BINARY = {
+    None: 'WhatsApp message has no decoded body',
+    'placeholderMessage': 'WhatsApp placeholderMessage not decoded',
+}
 BASE = {
     'id': 'message',
     'chat': '7@lid',
@@ -33,7 +37,7 @@ BASE = {
             1,
             False,
         ),
-        ({'kind': 'edit', 'target': 'original', 'edited': '2026-10-13T00:00:00Z'}, 1, False),
+        ({'kind': 'edit', 'target': 'original', 'edited': '2026-10-13T00:00:00Z'}, 2, False),
         (
             {
                 'text': '',
@@ -51,11 +55,13 @@ BASE = {
         ),
         ({'kind': 'reaction'}, 0, False),
         ({'kind': 'protocol', 'target': 'original'}, 0, False),
+        ({'kind': 'sender_key'}, 0, False),
         ({'kind': 'history_source'}, 0, False),
         ({'kind': 'context'}, 0, False),
         ({'chat': 'status@broadcast'}, 0, False),
         ({'status_broadcast': True}, 0, False),
         ({'kind': 'binary', 'text': ''}, 1, False),
+        ({'kind': 'binary', 'text': '', 'undecoded': 'placeholderMessage'}, 1, False),
         ({'id': ''}, 1, True),
         ({'text': {}}, 1, True),
         (None, 1, True),
@@ -67,10 +73,15 @@ def test_parser_table(changes, count, failed):
     if decoded and (decoded.get('status_broadcast') or decoded.get('chat') == 'status@broadcast'):
         assert docs == [Exclusion('status_broadcast')]
         return
+    if decoded and decoded.get('kind') == 'sender_key':
+        assert docs == [Exclusion('protocol')]
+        return
     if decoded and decoded.get('kind') in ('reaction', 'protocol'):
-        assert docs == [Exclusion(decoded['kind'])]
+        assert docs == [Exclusion(decoded['kind'], 'wa:synthetic:8@s.whatsapp.net:message')]
         return
     assert len(docs) == count
+    if decoded and decoded.get('kind') == 'edit':
+        assert docs[1] == Exclusion('edit', 'wa:synthetic:8@s.whatsapp.net:message')
     if not docs:
         return
     doc = docs[0]
@@ -91,6 +102,8 @@ def test_parser_table(changes, count, failed):
     if decoded.get('edited'):
         assert version(doc)['time'] > version(dict(doc, edited=BASE['timestamp']))['time']
     assert len(doc['attachments']) == len(decoded.get('media', []))
+    if decoded.get('kind') == 'binary':
+        assert doc['parts'] == [{'kind': 'binary', 'text': BINARY[decoded.get('undecoded')]}]
     for i, attachment in enumerate(doc['attachments']):
         assert attachment['id'] == f"{doc['id']}/att/{i}"
 
@@ -154,8 +167,18 @@ def test_whatsapp_spool_chain(tmp_path):
             )
         }
     ).encode()
-    daemon.record('whatsapp', edited, CTX)
+    # An older decode stored the edit's carrier and a reaction as blank messages.
+    stale = ('9@g.us:carrier', '8@s.whatsapp.net:reacted')
+    for chat, blank_id in (('9@g.us', 'carrier'), ('7@lid', 'reacted')):
+        blank = dict(BASE, chat=chat, id=blank_id, text='')
+        daemon.record('whatsapp', json.dumps({'decoded': blank}).encode(), CTX)
     daemon.commit()
+    assert all(daemon.index.lookup(f'wa:synthetic:{key}') for key in stale)
+    daemon.record('whatsapp', edited, CTX)
+    reaction = json.dumps({'decoded': dict(BASE, id='reacted', kind='reaction')}).encode()
+    daemon.record('whatsapp', reaction, CTX)
+    daemon.commit()
+    assert not any(daemon.index.lookup(f'wa:synthetic:{key}') for key in stale)
     assert not daemon.index.search('lighthouse')
     assert daemon.index.search('beacon')[0]['id'] == hit['id']
     before = daemon.checkpoint('indexed:whatsapp')['processed_through']
@@ -174,9 +197,23 @@ def test_whatsapp_spool_chain(tmp_path):
     daemon.commit()
     assert daemon.checkpoint('parser_exclusions:whatsapp') == {
         'status_broadcast': 2,
-        'reaction': 1,
+        'reaction': 2,
         'protocol': 1,
+        'edit': 1,
     }
     while not daemon.reindex('whatsapp', seconds=60):
         pass
     assert daemon.checkpoint('indexed:whatsapp')['processed_through'] == before + 180
+
+
+def test_sender_key_record_after_its_group_message_keeps_it(tmp_path):
+    from qmd2.ingestd import Ingestd
+
+    # A replay can capture the group message before the sender key record that shares its id.
+    daemon = Ingestd(tmp_path, remote=False)
+    content = dict(BASE, chat='9@g.us', sender='7@lid')
+    for decoded in (content, dict(content, text='', kind='sender_key')):
+        daemon.record('whatsapp', json.dumps({'decoded': decoded}).encode(), CTX)
+        daemon.commit()
+    assert daemon.index.lookup('wa:synthetic:9@g.us:message')
+    assert daemon.index.search('lighthouse')[0]['id'] == 'wa:synthetic:9@g.us:message'

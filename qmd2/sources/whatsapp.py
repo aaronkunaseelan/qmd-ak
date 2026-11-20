@@ -3,7 +3,7 @@
 import json
 from qmd2.doc import Exclusion
 
-PARSER_VERSION = 4
+PARSER_VERSION = 5
 
 
 def canonical(jid, aliases):
@@ -39,11 +39,18 @@ def _message(doc, decoded, ctx, account):
         raise ValueError()
     if decoded.get('kind') in ('history_source', 'context'):
         return []
+    aliases = ctx.get('aliases', {})
+    # A control record names its own id, so a doc an older decode stored there is removed. A sender
+    # key record does not: in groups it shares its id with the message it precedes.
+    own = f"wa:{account}:{canonical(decoded.get('chat'), aliases)}:{decoded.get('id')}"
+    if decoded.get('kind') == 'sender_key':
+        return [Exclusion('protocol')]
     if decoded.get('kind') in ('reaction', 'protocol'):
-        return [Exclusion(decoded['kind'])]
+        return [
+            Exclusion(decoded['kind'], own if decoded.get('chat') and decoded.get('id') else None)
+        ]
     if decoded.get('status_broadcast') or decoded.get('chat') == 'status@broadcast':
         return [Exclusion('status_broadcast')]
-    aliases = ctx.get('aliases', {})
     contacts, groups = ctx.get('contacts', {}), ctx.get('groups', {})
     chat = canonical(decoded['chat'], aliases)
     message = decoded['target'] if decoded.get('kind') == 'edit' else decoded['id']
@@ -83,5 +90,9 @@ def _message(doc, decoded, ctx, account):
             attachment['sha256'] = media['fileSHA256']
         doc['attachments'].append(attachment)
     if decoded.get('kind') == 'binary':
-        doc['parts'] = [{'kind': 'binary', 'text': 'WhatsApp message has no decoded body'}]
+        field = decoded.get('undecoded')
+        text = f'WhatsApp {field} not decoded' if field else 'WhatsApp message has no decoded body'
+        doc['parts'] = [{'kind': 'binary', 'text': text}]
+    if decoded.get('kind') == 'edit' and decoded.get('id') and own != identifier:
+        return [doc, Exclusion('edit', own)]
     return [doc]

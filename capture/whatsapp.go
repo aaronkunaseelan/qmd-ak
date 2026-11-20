@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
@@ -76,6 +77,7 @@ func waHistoryPairs(h *hs.HistorySync, pairs map[string]string) {
 	}
 }
 func waEmit(r *run, raw any, d waDecoded, fromMeKnown ...bool) error {
+	waKeepReply(&d, r.waOriginals)
 	db, _ := json.Marshal(d)
 	var decoded map[string]any
 	json.Unmarshal(db, &decoded)
@@ -237,7 +239,8 @@ func runWhatsApp(ctx context.Context, r *run) error {
 		return fmt.Errorf("whatsapp: journal unavailable")
 	}
 	sort.Strings(names)
-	if e = waJournalPairs(r, names, c.Pairs); e != nil {
+	r.waOriginals = map[string]waOriginal{}
+	if e = waJournalPairs(r, names, c.Pairs, r.waOriginals); e != nil {
 		return e
 	}
 	for _, name := range names {
@@ -247,6 +250,9 @@ func runWhatsApp(ctx context.Context, r *run) error {
 		if e = waReadSegment(ctx, r, &c, name); e != nil {
 			return e
 		}
+	}
+	if e = waReplayOriginals(ctx, r, &c, time.Now().Add(waReplaySlice)); e != nil {
+		return e
 	}
 	r.receipt.ConnectionHead = c.Connection
 	r.receipt.HeadComplete = true
@@ -268,7 +274,7 @@ func waImportHistory(ctx context.Context, r *run, c *waCursor) error {
 	var h hs.HistorySync
 	if proto.Unmarshal(b, &h) == nil && len(h.GetConversations()) > 0 {
 		waHistoryPairs(&h, c.Pairs)
-		hash, err := waArchiveHistory(r, b, c.Pairs, waHistoryContext(&h, c.Pairs))
+		hash, err := waArchiveHistory(r, b, c.Pairs, waHistoryContext(&h, c.Pairs), true)
 		if err != nil {
 			return err
 		}
@@ -314,7 +320,7 @@ func waImportHistoryJSON(ctx context.Context, r *run, c *waCursor, b []byte) err
 	for _, rec := range records {
 		waMergeContext(contextUpdate, waHistoryContext(rec.history, c.Pairs))
 	}
-	hash, err := waArchiveHistory(r, b, c.Pairs, contextUpdate)
+	hash, err := waArchiveHistory(r, b, c.Pairs, contextUpdate, true)
 	if err != nil {
 		return err
 	}
@@ -330,7 +336,7 @@ func waImportHistoryJSON(ctx context.Context, r *run, c *waCursor, b []byte) err
 	return waSave(r, c)
 }
 
-func waJournalPairs(r *run, names []string, pairs map[string]string) error {
+func waJournalPairs(r *run, names []string, pairs map[string]string, originals map[string]waOriginal) error {
 	for _, name := range names {
 		f, e := os.Open(name)
 		if e != nil {
@@ -362,6 +368,11 @@ func waJournalPairs(r *run, names []string, pairs map[string]string) error {
 				}
 			}
 			waInfoPairs(rec.Info, pairs)
+			if rec.Kind == "message" {
+				if m, err := waProto(rec.Proto); err == nil {
+					waRemember(originals, waString(rec.Info, "ID"), m, nil, waString(rec.Info, "Sender"), waString(rec.Info, "SenderAlt"))
+				}
+			}
 			if rec.Kind == "history_sync" {
 				h, _, _, err := waHistory(rec)
 				if err != nil {
@@ -369,6 +380,12 @@ func waJournalPairs(r *run, names []string, pairs map[string]string) error {
 					return waFail(r, err)
 				}
 				waHistoryPairs(h, pairs)
+				for _, conv := range h.GetConversations() {
+					for _, row := range conv.GetMessages() {
+						m := row.GetMessage()
+						waRemember(originals, m.GetKey().GetID(), m.GetMessage(), m.GetMessageSecret(), m.GetParticipant(), m.GetKey().GetParticipant())
+					}
+				}
 			}
 		}
 		f.Close()
@@ -440,6 +457,9 @@ func waJournalRecord(ctx context.Context, r *run, c *waCursor, line []byte, rec 
 		if e != nil {
 			return waFail(r, e)
 		}
+		if edit := waSecretEdit(rec.Info, m, r.waOriginals, c.Pairs); edit != nil {
+			m = edit
+		}
 		d, e := waDecode(rec.Info, m, c.Pairs)
 		if e != nil {
 			return waFail(r, e)
@@ -452,13 +472,24 @@ func waJournalRecord(ctx context.Context, r *run, c *waCursor, line []byte, rec 
 		if e != nil {
 			return waFail(r, e)
 		}
-		hash, err := waArchiveHistory(r, line, c.Pairs, waHistoryContext(h, c.Pairs))
+		hash, err := waArchiveHistory(r, line, c.Pairs, waHistoryContext(h, c.Pairs), true)
 		if err != nil {
 			return err
 		}
 		if e = waUnfold(ctx, r, h, hash, c.Pairs, lower, unknown, 0); e != nil {
 			return e
 		}
+	case "undecryptable_message":
+		// A visible marker, unless the journal also holds the message itself.
+		info, _ := rec.Info["Info"].(map[string]any)
+		d, e := waDecode(info, nil, c.Pairs)
+		if _, held := r.waOriginals[d.ID]; e != nil || held {
+			r.receipt.Enumerated++
+			r.receipt.Excluded++
+			return nil
+		}
+		d.Undecoded = "undecryptable message"
+		return waEmit(r, json.RawMessage(line), d)
 	default:
 		handled, err := waEmitContext(r, line, rec, c.Pairs)
 		if err != nil {
@@ -511,11 +542,14 @@ func waUnknownJSON(value any, desc protoreflect.MessageDescriptor) int {
 	return n
 }
 
-func waArchiveHistory(r *run, original []byte, pairs map[string]string, update map[string]any) (string, error) {
+// An original already in the archive (a replay) is not archived again; its context still is.
+func waArchiveHistory(r *run, original []byte, pairs map[string]string, update map[string]any, archive bool) (string, error) {
 	hash := digest(original)
 	metadata := ObservationState{Version: "whatsapp-original-v1", Labels: map[string]string{"archive_only": "true", "object_hash": hash, "size": strconv.Itoa(len(original)), "source": r.source}}
-	if e := r.emit("history:"+hash, original, metadata, time.Time{}); e != nil {
-		return "", e
+	if archive {
+		if e := r.emit("history:"+hash, original, metadata, time.Time{}); e != nil {
+			return "", e
+		}
 	}
 	all := make([]waPair, 0, len(pairs))
 	for lid, pn := range pairs {
@@ -566,4 +600,58 @@ func waHistoryContext(h *hs.HistorySync, pairs map[string]string) map[string]any
 		}
 	}
 	return out
+}
+
+// After a reset, ingestd copies each archived original to <state>/originals/<sha256>. Each run,
+// after the journal, decodes them again with this decoder for at most waReplaySlice, removing
+// each once its children are spooled under the same ids and refs; one that fails stays, counted.
+// A bare protobuf original carries no identity: counted as excluded and removed.
+const waReplaySlice = 50 * time.Second
+
+func waReplayOriginals(ctx context.Context, r *run, c *waCursor, deadline time.Time) error {
+	dir := filepath.Join(filepath.Dir(r.statePath), "originals")
+	entries, e := os.ReadDir(dir)
+	if os.IsNotExist(e) {
+		return nil
+	} else if e != nil {
+		return fmt.Errorf("whatsapp: originals unreadable")
+	}
+	// Replayed keys stay out of the checkpoint, which the live lane reloads every run.
+	hashes := r.state.Hashes
+	r.state.Hashes = map[string]string{}
+	defer func() { r.state.Hashes = hashes }()
+	for _, entry := range entries {
+		if e = ctx.Err(); e != nil || time.Now().After(deadline) {
+			return e
+		}
+		name := entry.Name()
+		if len(name) != 64 || strings.Trim(name, "0123456789abcdef") != "" {
+			continue
+		}
+		path := filepath.Join(dir, name)
+		before := r.receipt.Failed
+		b, e := inventoryReadLocal(path)
+		if records, h, err := waObjectRecords(b); e == nil && err == nil && h == nil && len(records) == 0 {
+			// A bare protobuf's identity was in its import inventory, not in the archive.
+			r.receipt.Enumerated++
+			r.receipt.Excluded++
+			r.receipt.ExclusionReasons["original_without_identity"]++
+		} else if e == nil {
+			e = waCaptureObject(ctx, r, c, b, inventoryRow{ObjectHash: name}, false)
+		}
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if e != nil {
+			if r.receipt.Failed == before {
+				r.fail()
+			}
+			r.receipt.FailedIDs = append(r.receipt.FailedIDs, "history:"+name)
+			continue
+		}
+		if e = os.Remove(path); e != nil {
+			return fmt.Errorf("whatsapp: original not removed")
+		}
+	}
+	return nil
 }

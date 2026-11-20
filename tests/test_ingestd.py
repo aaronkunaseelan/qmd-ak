@@ -812,22 +812,39 @@ def without_origin_index(store, rows=()):
     del writer
 
 
+def doc_pack_record(daemon, source, number):
+    """One doc-pack record as a rebuild reads it: a doc with a version, no capture behind it."""
+    from qmd2.doc import dumps, version
+
+    doc = dict(
+        id=f'{source}:synthetic#{number}',
+        item=f'{source}:synthetic',
+        source=source,
+        group='sessions',
+        kind='authored',
+        time='2026-10-13T01:00:00Z',
+        parts=[dict(kind='authored', text=f'synthetic origin {number}')],
+    )
+    doc['version'] = version(doc, 1)
+    daemon.packs.append('doc', source, {'id': doc['id']}, dumps(doc).encode())
+
+
 def test_a_failed_schema_rebuild_stays_a_rebuild(tmp_path, monkeypatch):
-    """Rebuild raises over an old-schema index: no request, no wrong outcome, no crash."""
+    """A rebuild that dies keeps its job and cursor: no request, no wrong outcome, one resume."""
+    from qmd2.doc import dumps as doc_dumps
     from qmd2.ingestd import Ingestd
-    from qmd2.packs import Packs
-    from qmd2.state import State
 
     monkeypatch.setattr('qmd2.ingestd.LEASE', tmp_path / 'heavy.lock')
     store = tmp_path / 'store'
     daemon = Ingestd(store, remote=False)
+    # Two doc packs: 'claude' is rebuilt first, then the 'pi' pack cannot be read.
+    doc_pack_record(daemon, 'claude', 1)
+    doc_pack_record(daemon, 'pi', 2)
+    daemon.commit()
+    unreadable = daemon.packs.path('doc', 'pi', 0)
+    saved = unreadable.read_bytes()
     close_daemon(daemon)
-    writable = State(store, True)
-    corrupt = Packs(writable, writable=True)
-    corrupt.append('doc', 'pi', {'id': 'pi:synthetic#broken'}, b'{"id":"pi:synthetic#broken"}')
-    corrupt.sync()
-    writable.commit()
-    writable.db.close()
+    del daemon
     # The old index holds the parent of an attachment whose outcome is still pending.
     parent = 'wa:synthetic:chat:7'
     without_origin_index(
@@ -848,7 +865,7 @@ def test_a_failed_schema_rebuild_stays_a_rebuild(tmp_path, monkeypatch):
     pending.mkdir(parents=True)
     queued = pending / (hashlib.sha256(attachment.encode()).hexdigest() + '.json')
     queued.write_text(
-        json.dumps(
+        doc_dumps(
             dict(
                 id=attachment,
                 state='done',
@@ -860,35 +877,29 @@ def test_a_failed_schema_rebuild_stays_a_rebuild(tmp_path, monkeypatch):
                 enqueued_at=1.0,
                 ended_at=2.0,
                 pipeline_revision=1,
-                output=dict(
-                    id=attachment + '/ocr',
-                    item=attachment,
-                    source='whatsapp',
-                    group='mail',
-                    kind='ocr',
-                    time='2026-10-13T01:00:00Z',
-                    parts=[dict(kind='attachment_text', text='Synthetic harbour label')],
-                    context=dict(parent=parent),
-                    pipeline_revision=1,
-                ),
             )
         )
     )
+    unreadable.unlink()
 
     daemon = Ingestd(store, remote=False)
     try:
         assert daemon.rebuild_on_start and (store / 'reindex.request').exists()
         daemon.request(seconds=60)
-        # The rebuild died on the record without a source; it stays owed, so nothing looks normal.
+        # The rebuild advanced over the first pack, then died on the unreadable one and stays owed.
         assert not (store / 'reindex.request').exists()
         assert daemon.maintenance is not None and daemon.visible_index is not None
         assert daemon.maintenance['source'] is None and daemon.maintenance['stage'] == 'read'
+        cursor = dict(daemon.maintenance['cursor'])
+        assert list(cursor) == ['claude:0']
+        assert daemon.index.path == store / 'index-rebuild'
+        assert daemon.index.lookup('claude:synthetic#1')
         result = json.loads((store / 'reindex.result').read_text())
-        assert result['ok'] is False and result['exception_class'] == 'KeyError'
+        assert result['ok'] is False and result['exception_class'] == 'FileNotFoundError'
         # Nothing left to drive: a further turn writes nothing and retries nothing.
         daemon.request(seconds=60)
         assert json.loads((store / 'reindex.result').read_text()) == result
-        # An owed rebuild defers attachment outcomes: no parent_unavailable, the row is untouched.
+        # An owed rebuild defers attachment outcomes: no outcome record, the row is untouched.
         records = daemon.stats['records']
         daemon.attachment_outcomes(seconds=5)
         daemon.commit()
@@ -897,11 +908,23 @@ def test_a_failed_schema_rebuild_stays_a_rebuild(tmp_path, monkeypatch):
     finally:
         close_daemon(daemon)
         del daemon
-    # The next start resumes the owed rebuild instead of dying on the old index.
+    # The next start resumes the owed rebuild from its cursor instead of rebuilding from scratch.
+    unreadable.write_bytes(saved)
     daemon = Ingestd(store, remote=False)
     try:
         assert (store / 'reindex.request').exists()
         assert daemon.maintenance['source'] is None and daemon.visible_index is not None
+        assert daemon.maintenance['cursor'] == cursor
+        assert daemon.index.path == store / 'index-rebuild'
+        assert daemon.index.lookup('claude:synthetic#1')
+        # One request finishes it: the read cursor holds, the index swaps in, the request goes.
+        daemon.request(seconds=60)
+        assert daemon.maintenance is None and daemon.visible_index is None
+        assert daemon.index.path == store / 'index'
+        assert json.loads((store / 'reindex.result').read_text())['ok'] is True
+        assert not (store / 'reindex.request').exists()
+        assert daemon.index.lookup('claude:synthetic#1')
+        assert daemon.index.lookup('pi:synthetic#2')
     finally:
         close_daemon(daemon)
 

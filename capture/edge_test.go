@@ -138,3 +138,44 @@ func checkJournalSpool(t *testing.T, spool string) {
 		t.Fatal("spool object layout invalid")
 	}
 }
+
+// An undecryptable message leaves a visible marker, unless the journal also holds the message.
+func TestJournalUndecryptableMarker(t *testing.T) {
+	root := t.TempDir()
+	journal := filepath.Join(root, "journal")
+	os.Mkdir(journal, 0700)
+	text := "synthetic message"
+	p, _ := proto.Marshal(&e2e.Message{Conversation: &text})
+	info := func(id string) map[string]any {
+		return map[string]any{"ID": id, "Chat": "12025550123@s.whatsapp.net", "Sender": "12025550123@s.whatsapp.net", "Timestamp": "2026-10-13T19:00:00Z"}
+	}
+	var lines []byte
+	for _, rec := range []map[string]any{
+		{"kind": "header", "info": map[string]any{"account_jid": "synthetic-account"}},
+		{"kind": "undecryptable_message", "info": map[string]any{"Info": info("lost"), "IsUnavailable": false}},
+		{"kind": "undecryptable_message", "info": map[string]any{"Info": info("late"), "IsUnavailable": false}},
+		{"kind": "message", "info": info("late"), "proto_b64": base64.StdEncoding.EncodeToString(p)},
+	} {
+		b, _ := json.Marshal(rec)
+		lines = append(append(lines, b...), '\n')
+	}
+	os.WriteFile(filepath.Join(journal, "00000001.jsonl"), lines, 0600)
+	spool := filepath.Join(root, "spool")
+	a, code := captureChild(t, append(os.Environ(), "QMD2_CAPTURE_TEST_CHILD=1"), "whatsapp", "--account", "synthetic-account", "--journal", journal, "--spool", spool, "--state", filepath.Join(root, "state"), "--env-file", filepath.Join(root, "absent.env"))
+	if code != 0 || a.Written != 2 || a.Excluded != 2 {
+		t.Fatalf("capture %+v code %d", a, code)
+	}
+	index, _ := os.ReadFile(filepath.Join(spool, "index.jsonl"))
+	kinds := map[string]string{}
+	for _, line := range splitLines(index) {
+		var entry SpoolEntry
+		json.Unmarshal(line, &entry)
+		payload, _ := os.ReadFile(filepath.Join(spool, entry.Path))
+		var body struct{ Decoded waDecoded }
+		json.Unmarshal(payload, &body)
+		kinds[body.Decoded.ID] = body.Decoded.Kind + ":" + body.Decoded.Undecoded
+	}
+	if kinds["lost"] != "binary:undecryptable message" || kinds["late"] != "message:" {
+		t.Fatalf("spooled %v", kinds)
+	}
+}
