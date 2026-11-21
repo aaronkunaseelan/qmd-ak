@@ -475,7 +475,8 @@ def publish_telemetry(home, status, now, state, checks, level, ratio):
             system='qmd2',
             at=now,
             state=state,
-            checks=checks,
+            # telemetry/1 caps a reason at 160 characters; mech-d drops the whole document otherwise.
+            checks=[dict(c, reason=c['reason'] if len(c['reason']) <= 160 else c['reason'][:159] + '…') for c in checks],
             metrics=metrics(home, status or {}, now)
             + [
                 dict(name='priority_level', labels={}, value=level, unit='level'),

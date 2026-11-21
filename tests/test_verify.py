@@ -544,3 +544,17 @@ def test_capture_transient_failure_needs_two_runs(tmp_path):
         if capture:
             detail = json.loads((tmp_path / 'alerts.jsonl').read_text())['reasons']['x:capture']
             assert error in detail and f'runs={runs}' in detail, detail
+
+
+def test_publish_telemetry_caps_reasons_at_160(tmp_path, monkeypatch):
+    from qmd2 import verify
+    monkeypatch.setenv('XDG_STATE_HOME', str(tmp_path))
+    monkeypatch.setattr(verify, 'metrics', lambda home, status, now: [])
+    long = 'Recent attachment failure: id=' + 'x' * 200
+    checks = [dict(name='attachments:failure', ok=False, reason=long), dict(name='a', ok=True, reason='fine')]
+    verify.publish_telemetry(tmp_path, {}, time.time(), 'red', checks, 0, 0.0)
+    out = json.loads((tmp_path / 'telemetry' / 'qmd2.json').read_text())
+    assert [len(c['reason']) <= 160 for c in out['checks']] == [True, True]
+    assert out['checks'][0]['reason'].startswith('Recent attachment failure: id=')
+    assert out['checks'][1]['reason'] == 'fine'
+    assert checks[0]['reason'] == long
