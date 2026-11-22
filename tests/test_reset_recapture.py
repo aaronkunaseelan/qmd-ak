@@ -405,3 +405,53 @@ def test_reset_redecodes_an_archived_whatsapp_original(tmp_path):
     assert code == 0 and 'synthetic lighthouse' in text
     code, text = get(store, 'wa:synthetic:8@s.whatsapp.net:received')
     assert code == 0 and 'harbour' in text
+
+
+def feed_items(store, since):
+    result = run(
+        store,
+        'qmd2.cli',
+        '--home',
+        str(store),
+        'feed',
+        '--source',
+        'instapaper',
+        '--since-arrival',
+        datetime.fromtimestamp(since, timezone.utc).isoformat(),
+        '--json',
+    )
+    return json.loads(result.stdout)['items']
+
+
+def test_reset_recapture_of_an_unchanged_doc_is_no_arrival(tmp_path):
+    store = tmp_path / '.local/share/qmd2'
+    initial(store)
+    from qmd2.state import State
+
+    state = State(store)
+    try:
+        epoch = state.get('feed_epoch')['at']
+    finally:
+        state.db.close()
+    before = {
+        item['id']: json.loads(item['version'])['hash'] for item in feed_items(store, epoch + 0.001)
+    }
+
+    since = time.time()
+    assert request(store, 'reset', source='instapaper', reset=True) == {'id': 'reset', 'ok': True}
+    rows = {key: (snapshot(key, BOOKMARKS[key][1]), {'folder': 'archive'}) for key in BOOKMARKS}
+    rows['1'] = (snapshot('1', f'<p>{BOOKMARKS["1"][2]}</p>'), {'folder': 'archive'})
+    spool(store, stamp(60), rows)
+    ingest(store)
+
+    # The reset re-captured every payload; only the one whose content changed is an arrival.
+    items = feed_items(store, since)
+    assert [item['id'] for item in items] == ['instapaper:synthetic:1']
+    assert json.loads(items[0]['version'])['hash'] != before['instapaper:synthetic:1']
+
+    # The two unchanged payloads are counted by ingestd, not written.
+    state = State(store)
+    try:
+        assert state.get('unchanged:instapaper') == 2
+    finally:
+        state.db.close()

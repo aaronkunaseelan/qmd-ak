@@ -16,6 +16,8 @@ import time
 from pathlib import Path
 
 from .attachments import (
+    auto_extracted,
+    enqueue,
     enqueue_auto,
     snapshot as attachment_status,
     outcome_record,
@@ -26,7 +28,7 @@ from .attachments import (
     matches_outcome,
 )
 from .b2 import B2
-from .doc import Exclusion, date, dumps, version, visible
+from .doc import Exclusion, date, dumps, newer, version, visible
 from .index import Index
 from .packs import MAINTENANCE_INTERVAL, Packs, payload_integrity, room
 from .sources import SOURCES, ARCHIVE_ONLY_SOURCES, kill_timeout
@@ -417,6 +419,47 @@ class Ingestd:
         if self.published_newest.get(source) in ids:
             self.last_status = float('-inf')
 
+    def count_unchanged(self, source):
+        # A re-captured doc whose version still matches is no arrival. The capture receipt is the
+        # capture's own account (receive_capture replaces it), so ingestd keeps its own count.
+        count = self.checkpoint('unchanged:' + source, 0)
+        self.queue_checkpoint('unchanged:' + source, count + 1)
+
+    def restore_attachments(self, source, doc, previous):
+        """A restored message reopens the outputs an exclusion removed after its last version."""
+        for attachment in doc['attachments']:
+            identifier = attachment.get('id')
+            if not identifier:
+                continue
+            tombstones = []
+            ocr = False
+            for (key,) in self.state.db.execute(
+                "SELECT key FROM checkpoints WHERE key LIKE ?",
+                ('deleted:' + identifier + '%',),
+            ):
+                if key == 'deleted:' + identifier or key.startswith(
+                    'deleted:' + identifier + '/'
+                ):
+                    value = self.state.get(key)
+                    if value:
+                        tombstones.append(value)
+                        ocr = ocr or key == 'deleted:' + identifier + '/ocr'
+            if not any(newer(tombstone, previous) for tombstone in tombstones):
+                continue
+            ref = dict(attachment, source=source)
+            if ocr:
+                # Read on this connection: the tombstone may not be committed yet.
+                ref['prior_text'] = True
+            enqueue(
+                self.home,
+                identifier,
+                doc,
+                ref,
+                automatic=False,
+                retry_failed=True,
+                media_only=not auto_extracted(source, ref),
+            )
+
     def documents(
         self, source, docs, origin, capture, refresh=False, reparse=False, item_time=None
     ):
@@ -436,6 +479,23 @@ class Ingestd:
             self.processed(source, outcome_time)
             if source == 'files' and doc['kind'] == 'tombstone':
                 continue
+            current = self.index.pending.get(doc['id'])
+            if current is None:
+                row = self.index.lookup(doc['id'])
+                current = row['version'] if row else None
+            if (
+                not refresh
+                and not reparse
+                and doc['kind'] != 'tombstone'
+                and 'outcome' not in doc
+                and current
+            ):
+                candidate = version(doc, capture, self.checkpoint('epoch:' + source, 0))
+                if not current.get('deleted') and all(
+                    candidate[key] == current.get(key) for key in ('hash', 'time', 'parser')
+                ):
+                    self.count_unchanged(source)
+                    continue
             if doc['kind'] == 'tombstone':
                 self.unpublish_if_newest(source, {doc['id']})
             self.reindex_doc_id = doc['id']
@@ -450,6 +510,9 @@ class Ingestd:
                 self.reparse_seen.add(doc['id'])
             if not deferred and self.index.upsert(doc, pointer, refresh=refresh):
                 self.stats['docs'] += doc['kind'] != 'attachment_outcome'
+                if doc['kind'] == 'message' and doc.get('attachments'):
+                    previous = current if current and not current.get('deleted') else None
+                    self.restore_attachments(source, doc, previous)
             if doc.get('parse_failed'):
                 failures = self.checkpoint('parse_failures:' + source, 0)
                 self.queue_checkpoint('parse_failures:' + source, failures + 1)

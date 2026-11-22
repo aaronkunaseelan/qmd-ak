@@ -257,3 +257,49 @@ def test_a_vision_image_doc_covers_its_one_page(vision, tmp_path, monkeypatch):
     assert doc['pages'] == dict(covered=1, total=1, requested=None, azure=0)
     assert 'Extracted' not in render(doc)
     assert row['azure_pages'] == 0 and row['pages_read'] == 1
+
+
+def test_an_empty_vision_read_with_prior_text_is_read_by_azure(vision, tmp_path, monkeypatch):
+    from qmd2.attachments import enqueue, queue_path
+    from qmd2.state import State
+
+    monkeypatch.setattr(
+        Ocr, 'answer', dict(engine='apple-vision@27.2/rev3', secs=0.2, pages=pages(text=''))
+    )
+    azure_calls = []
+    azure(azure_calls, monkeypatch)
+
+    identifier = 'wa:synthetic:8@s.whatsapp.net:message/att/0'
+    home = tmp_path / 'qmd'
+    state = State(home, writable=True)
+    state.set('deleted:' + identifier + '/ocr', {'deleted': True})
+    state.commit()
+    state.db.close()
+    parent = dict(
+        id='wa:synthetic:8@s.whatsapp.net:message',
+        source='whatsapp',
+        group='mail',
+        time='2026-10-13T00:00:00Z',
+    )
+    ref = dict(source='whatsapp', type='image/png')
+    enqueue(home, identifier, parent, ref, automatic=False, retry_failed=True)
+    row = json.loads(queue_path(home, identifier).read_text())
+    assert row['ref']['prior_text'] is True
+
+    text, model, tag = attachments.extract(row, image(tmp_path))
+    assert (text, model, tag) == (
+        TEXT,
+        'azure-document-intelligence:prebuilt-read@2024-11-30',
+        'ocr',
+    )
+    assert row['vision'] == 'empty'
+    assert row['azure_pages'] == 1
+    assert azure_calls == [('prebuilt-read', None)]
+
+    # Without prior_text the same empty read is Vision's answer, and Azure stays unasked.
+    azure_calls.clear()
+    row = dict(ref={})
+    with pytest.raises(attachments.Unavailable, match='no_text'):
+        attachments.extract(row, image(tmp_path))
+    assert row['azure_pages'] == 0
+    assert azure_calls == []

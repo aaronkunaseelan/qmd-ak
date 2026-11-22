@@ -292,6 +292,9 @@ def enqueue(
     if queued:
         # A retry replaces the failed queue row it read; publish_queue never overwrites one.
         remove_queue(path)
+    ref = dict(ref)
+    if prior_text(home, identifier):
+        ref['prior_text'] = True
     row = dict(
         id=identifier,
         parent={
@@ -347,6 +350,31 @@ def media_refs(source, raw):
         or envelope.get('entities')
         or {}
     ).get('media', [])
+
+
+def auto_extracted(source, ref):
+    """Whether enqueue_auto extracts these bytes, or only archives them (a doc's flattened type)."""
+    kind = str(ref.get('type') or '')
+    if '/' in kind:
+        kind = kind.split('/', 1)[0]
+    if ref.get('mimetype') == 'image/gif' or ref.get('type') == 'image/gif':
+        return False
+    return (source == 'whatsapp' and kind in ('audio', 'image')) or (
+        source == 'x' and kind in ('photo', 'image')
+    )
+
+
+def prior_text(home, identifier):
+    """Whether this attachment's OCR output was tombstoned, so Vision's empty read is a loss."""
+    from .state import State
+
+    if not (Path(home) / 'state.sqlite').exists():
+        return False
+    state = State(home)
+    try:
+        return state.get('deleted:' + identifier + '/ocr') is not None
+    finally:
+        state.db.close()
 
 
 def enqueue_auto(home, raw, docs, capture, automatic=True):
@@ -1487,14 +1515,17 @@ def extract(row, path, step=lambda message: None):
                 read = (None, 'pages_selected', None)
                 if kind == 'image' or not pages:
                     read = vision_ocr(path)
-            if read[0] is not None:
+            if read[0] is not None and not (read[0] == '' and row['ref'].get('prior_text')):
                 text, model, row['pages_read'] = read
                 row['azure_pages'] = 0
                 # m3 reads the whole document (an image is one page) and answers how many it read.
                 row['total_pages'] = row['pages_read']
             else:
-                if read[1] is not None:
+                if read[1] is not None and read[0] is None:
                     row['vision'] = read[1]
+                if read[0] == '':
+                    # This attachment had text before: an empty read is a loss, not its answer.
+                    row['vision'] = 'empty'
                 text, model, row['azure_pages'] = azure_di(
                     path, 'prebuilt-layout' if kind in ('pdf', 'docx') else 'prebuilt-read', pages
                 )

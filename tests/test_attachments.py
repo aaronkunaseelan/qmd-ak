@@ -877,3 +877,101 @@ def test_retry_delay_filesystem_edge(tmp_path):
     save(path, row)
     row = finish(tmp_path, row)
     assert row['state'] == 'failed' and row['attempts'] == 2
+
+
+def test_a_restored_message_gets_its_tombstoned_output_back(tmp_path, monkeypatch):
+    from qmd2 import attachments
+
+    home = tmp_path / 'qmd'
+    home.mkdir()
+    parent = 'wa:synthetic:9@g.us:message'
+    text = 'Synthetic lighthouse harbor'
+    image = b'\x89PNG\r\n\x1a\n' + b'synthetic pixels' * 8
+    decoded = {
+        'id': 'message',
+        'chat': '9@g.us',
+        'sender': '8@s.whatsapp.net',
+        'timestamp': '2026-10-20T00:00:00Z',
+        'kind': 'message',
+        'text': 'Synthetic harbor',
+        'media': [
+            dict(
+                type='image',
+                mimetype='image/png',
+                fileName='photo.png',
+                fileLength=str(len(image)),
+            )
+        ],
+    }
+    ctx = {'account': 'synthetic', 'key': '9@g.us:message', 'time': '2026-10-20T00:00:00Z'}
+
+    def entry(source, key, body, archive):
+        return dict(
+            schema='qmd.spool-entry.v1',
+            source=source,
+            account='synthetic',
+            key=key,
+            sha256=hashlib.sha256(body).hexdigest(),
+            bytes=len(body),
+            path='',
+            captured_at='2026-10-20T00:00:00Z',
+            state={'labels': {'archive_only': 'true'} if archive else {}},
+        )
+
+    def send(lane, name, row, body):
+        root = home / 'spool' / lane
+        root.mkdir(parents=True, exist_ok=True)
+        (root / name).write_bytes(body)
+        with (root / 'index.jsonl').open('a') as index:
+            index.write(json.dumps(dict(row, path=name)) + '\n')
+
+    message = dumps({'raw': {'journal': 'synthetic'}, 'decoded': decoded}).encode()
+    send('whatsapp', 'payload', entry('whatsapp', '9@g.us:message', message, False), message)
+    send('attachment', 'payload', entry('attachment', parent + '/att/0', image, True), image)
+    daemon = Ingestd(home, remote=False)
+    try:
+        daemon.spool()
+        daemon.commit()
+        assert queue_path(home, parent + '/att/0').exists()
+
+        monkeypatch.setattr(attachments, 'vision_ocr', lambda path: (text, 'synthetic-vision@1', 1))
+        monkeypatch.setattr(attachments, 'azure_di', lambda *a, **k: pytest.fail('azure called'))
+        assert attachments.demand(home, parent + '/att/0', lambda message: None)['state'] == 'done'
+        daemon.spool()
+        daemon.commit()
+        assert daemon.index.lookup(parent + '/att/0/ocr')
+        daemon.attachment_outcomes()
+        assert not queue_path(home, parent + '/att/0').exists()
+
+        # The protocol record exclusions the message and its independently stored output.
+        protocol = dumps({'decoded': dict(decoded, kind='protocol')}).encode()
+        daemon.record('whatsapp', protocol, ctx)
+        daemon.commit()
+        assert daemon.state.get('deleted:' + parent + '/att/0/ocr')
+
+        # A restored child of an archived original is not an automatic arrival, so enqueue_auto
+        # skips it; the message's own write is what reopens the tombstoned output, and the queued
+        # ref knows the output had text.
+        restored = dumps({'raw': {'history_sha256': 'synthetic'}, 'decoded': decoded}).encode()
+        daemon.record('whatsapp', restored, ctx)
+        daemon.commit()
+        queued = queue_path(home, parent + '/att/0')
+        assert queued.exists()
+
+        row = json.loads(queued.read_text())
+        assert row['ref'].get('prior_text') is True
+        assert attachments.process(home, row, lambda message: None)['state'] == 'done'
+        daemon.spool()
+        daemon.commit()
+        result = subprocess.run(
+            [sys.executable, '-m', 'qmd2.cli', '--home', str(home), 'get', parent + '/att/0'],
+            env=dict(os.environ, HOME=str(home)),
+            capture_output=True,
+            text=True,
+        )
+        assert result.returncode == 0 and text in result.stdout
+    finally:
+        daemon.upload_pool.shutdown()
+        daemon.index.writer.wait_merging_threads()
+        daemon.state.db.close()
+        daemon.lock.close()
