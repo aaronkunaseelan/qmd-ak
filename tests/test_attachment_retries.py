@@ -198,23 +198,30 @@ def test_stage_failed_names_its_stage_and_whether_it_passes(stage, kind):
     reason = attachments.temporary_refusal(error)[1]
     assert attachments.temporary_refusal(error) == (kind, f'stage_failed ({stage})')
     assert str(error) == stage
-    # A label is a literal: no path, URL or message content reaches the status.
+    # A failure with no child detail is its literal alone: no path, URL or message content.
     assert '/' not in reason and ':' not in reason
 
 
-def test_converter_exit_code_reaches_the_label_and_its_stderr_does_not():
+def test_converter_exit_names_its_code_and_the_last_stderr_line_as_its_cause():
+    message = 'engine failed: ' + 'x' * 300
     with pytest.raises(attachments.StageFailed) as failed:
         attachments.run(
             [
                 sys.executable,
                 '-c',
-                'import sys; print("/home/private/invoice.pdf", file=sys.stderr); sys.exit(7)',
+                'import sys\n'
+                'print("ffmpeg version 7.1", file=sys.stderr)\n'
+                f'print("  {message}  ", file=sys.stderr)\n'
+                'sys.exit(1)\n',
             ]
         )
-    assert failed.value.stage == 'converter failed (exit 7)'
+    assert failed.value.stage == 'converter failed (exit 1)'
+    assert failed.value.code == 1
+    # The last line, stripped and bounded: a cause, not a transcript.
+    assert failed.value.detail == message[:200]
     assert attachments.temporary_refusal(failed.value) == (
         'permanent',
-        'stage_failed (converter failed (exit 7))',
+        f'stage_failed (converter failed (exit 1): {message[:200]})',
     )
 
 

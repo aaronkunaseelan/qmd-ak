@@ -15,14 +15,26 @@ ORIGINS = (
 )
 ORIGIN_PATHS = tuple((Path(p), label) for p, label in ORIGINS)
 ORIGIN_LABELS = ('steward', 'gsd', 'interactive')
+REMOTE = Path.home() / 'agents/remote'
+HOST = 'oci'
 ROOTS = [
     ('pi', Path.home() / 'agents/pi/sessions'),
     ('codex', Path.home() / '.codex/sessions'),
     ('claude', Path.home() / '.claude/projects'),
     ('codex', Path.home() / 'agents/codex/sessions'),
     ('claude', Path.home() / 'agents/claude-code/projects'),
+    # Another machine's sessions, synced by directory name; the name is that machine's host.
+    ('claude', REMOTE / 'mac-air/claude'),
+    ('codex', REMOTE / 'mac-air/codex'),
+    ('pi', REMOTE / 'mac-air/pi'),
 ]
 QMD = re.compile(r'(?<![\w-])(?:~?/[^\s"\x27;]*)?qmd2?(?=\s|["\x27;]|$)')
+
+
+def host(path):
+    # A session under a synced `~/agents/remote/<host>/` root names its machine; others are ours.
+    path = Path(path)
+    return path.relative_to(REMOTE).parts[0] if path.is_relative_to(REMOTE) else HOST
 
 
 @functools.lru_cache(maxsize=4096)
@@ -125,6 +137,9 @@ def parse(raw, ctx):
     runtime = ctx['runtime']
     session = ctx.get('session', 'unknown')
     offset = ctx.get('offset', 0)
+    label = ctx.get('host', HOST)
+    # Two machines keep their own file names, so a remote session's key names its host.
+    item = f'{runtime}:{session}' if label == HOST else f'{runtime}:{label}:{session}'
     try:
         row = json.loads(raw)
         if not isinstance(row, dict):
@@ -141,7 +156,6 @@ def parse(raw, ctx):
         if not parts:
             return []
         entry = row.get('uuid') or (row.get('id') if runtime == 'pi' else None) or offset
-        item = f'{runtime}:{session}'
         context = {k: ctx[k] for k in ('title', 'project', 'first_user', 'parent') if ctx.get(k)}
         if ctx.get('agent'):
             context['parent'] = item
@@ -152,6 +166,7 @@ def parse(raw, ctx):
             'source': runtime,
             'group': 'sessions',
             'origin': origin(ctx.get('project')),
+            'host': label,
             'kind': 'authored' if any(p['kind'] == 'authored' for p in parts) else 'tool_output',
             'time': row.get(
                 'timestamp', m.get('timestamp', ctx.get('time', '1970-01-01T00:00:00Z'))
@@ -167,11 +182,12 @@ def parse(raw, ctx):
     except (ValueError, TypeError, KeyError, AttributeError):
         return [
             {
-                'id': f'{runtime}:{session}#{offset}',
-                'item': f'{runtime}:{session}',
+                'id': f'{item}#{offset}',
+                'item': item,
                 'source': runtime,
                 'group': 'sessions',
                 'origin': origin(ctx.get('project')),
+                'host': label,
                 'kind': 'binary',
                 'time': ctx.get('time', '1970-01-01T00:00:00Z'),
                 'context': {},
@@ -242,7 +258,13 @@ def _session_parts(m, role, mt, calls):
 def context(path, runtime):
     path = Path(path)
     session = path.stem
-    ctx = {'runtime': runtime, 'session': session, 'offset': 0, 'calls': {}}
+    ctx = {
+        'runtime': runtime,
+        'session': session,
+        'offset': 0,
+        'calls': {},
+        'host': host(path),
+    }
     if path.parent.name == 'subagents' or path.stem.startswith('agent-'):
         ctx['agent'] = path.stem.removeprefix('agent-')
         if path.parent.name == 'subagents':

@@ -15,7 +15,7 @@ from .policy import KIND_WEIGHT, text
 
 def schema():
     b = tantivy.SchemaBuilder()
-    for name in ('id', 'item', 'source', 'group', 'kind', 'origin'):
+    for name in ('id', 'item', 'source', 'group', 'kind', 'origin', 'host'):
         b.add_text_field(name, stored=True, tokenizer_name='raw')
     b.add_date_field('time', stored=True, fast=True)
     for name in ('title', 'from', 'context', 'body'):
@@ -47,6 +47,7 @@ class Index:
             self.writer = None
         self.schema = self.index.schema
         self.origin_field = has_field(self.schema, 'origin')
+        self.host_field = has_field(self.schema, 'host')
         self.pending = {}
         self.index.reload()
         self.searcher = self.index.searcher()
@@ -135,6 +136,7 @@ class Index:
             'source': doc['source'],
             'group': doc['group'],
             'origin': doc.get('origin', ''),
+            'host': doc.get('host', ''),
             'kind': doc['kind'],
             'time': date(doc.get('time')).replace(tzinfo=None),
             'title': doc.get('title', ''),
@@ -184,6 +186,24 @@ class Index:
             [(tantivy.Occur.Should, branch(label)) for label in labels]
         )
 
+    def host_clause(self, labels):
+        """Session hosts: `oci` is this machine, a synced root's directory name another.
+
+        An index built before the host field holds only this machine's sessions.
+        """
+        if not self.host_field:
+            if 'oci' in labels:
+                return self.term('group', 'sessions')
+            return tantivy.Query.boolean_query(
+                [
+                    (tantivy.Occur.Must, tantivy.Query.all_query()),
+                    (tantivy.Occur.MustNot, tantivy.Query.all_query()),
+                ]
+            )
+        return tantivy.Query.boolean_query(
+            [(tantivy.Occur.Should, self.term('host', label)) for label in labels]
+        )
+
     def filters(
         self,
         query,
@@ -194,6 +214,8 @@ class Index:
         include_outcomes=False,
         origins=None,
         not_origins=None,
+        hosts=None,
+        not_hosts=None,
     ):
         clauses = [(tantivy.Occur.Must, query)]
         if not include_outcomes:
@@ -224,6 +246,11 @@ class Index:
         if self.origin_field:
             for label in not_origins or ():
                 clauses.append((tantivy.Occur.MustNot, self.term('origin', label)))
+        if hosts:
+            clauses.append((tantivy.Occur.Must, self.host_clause(hosts)))
+        if self.host_field:
+            for label in not_hosts or ():
+                clauses.append((tantivy.Occur.MustNot, self.term('host', label)))
         until = ceiling(until)
         if since or until:
             clauses.append(
@@ -251,7 +278,17 @@ class Index:
                     clauses.append((tantivy.Occur.MustNot, self.term('item', item)))
         return tantivy.Query.boolean_query(clauses)
 
-    def scan(self, source=None, since=None, until=None, query=None, origins=None, not_origins=None):
+    def scan(
+        self,
+        source=None,
+        since=None,
+        until=None,
+        query=None,
+        origins=None,
+        not_origins=None,
+        hosts=None,
+        not_hosts=None,
+    ):
         query = self.filters(
             query or tantivy.Query.all_query(),
             source,
@@ -261,6 +298,8 @@ class Index:
             include_outcomes=True,
             origins=origins,
             not_origins=not_origins,
+            hosts=hosts,
+            not_hosts=not_hosts,
         )
         count = self.searcher.search(query, limit=1).count
         for offset in range(0, count, 500):
@@ -270,7 +309,16 @@ class Index:
                 yield self.row(address)
 
     def search(
-        self, query, source=None, since=None, limit=10, until=None, origins=None, not_origins=None
+        self,
+        query,
+        source=None,
+        since=None,
+        limit=10,
+        until=None,
+        origins=None,
+        not_origins=None,
+        hosts=None,
+        not_hosts=None,
     ):
         words = re.findall(r'\w+', query)
         if not words:
@@ -282,7 +330,14 @@ class Index:
                 escaped, ['title', 'context', 'body'], conjunction_by_default=conjunction
             )
             parsed = self.filters(
-                parsed, source, since, until, origins=origins, not_origins=not_origins
+                parsed,
+                source,
+                since,
+                until,
+                origins=origins,
+                not_origins=not_origins,
+                hosts=hosts,
+                not_hosts=not_hosts,
             )
             grouped = {}
             for page in range(3):
@@ -353,6 +408,8 @@ class Index:
         cursor=0,
         origins=None,
         not_origins=None,
+        hosts=None,
+        not_hosts=None,
     ):
         query = self.filters(
             tantivy.Query.all_query(),
@@ -361,6 +418,8 @@ class Index:
             until,
             origins=origins,
             not_origins=not_origins,
+            hosts=hosts,
+            not_hosts=not_hosts,
         )
         hits = self.searcher.search(query, limit=limit, offset=cursor, order_by_field='time').hits
         rows = [self.row(a) for _, a in hits]

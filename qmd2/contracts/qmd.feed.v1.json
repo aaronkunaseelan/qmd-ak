@@ -14,7 +14,7 @@
     "At least once: a version may be returned again after a restart; consumers dedupe on (id, version).",
     "--since-arrival T is exact for T at or after the arrival epoch (the first deploy of qmd.feed.v1; versions written earlier carry arrived null): it starts at the first version whose arrival is at or after T. A T before the epoch exits 2 naming the epoch; it never silently starts late.",
     "--after and --since-arrival are mutually exclusive; giving neither is a usage error (exit 2): a consumer always chooses its start.",
-    "Each item carries its own origin (steward, gsd, interactive; null off sessions), so a tombstone is filtered like the doc it removes.",
+    "Each item carries its own origin (steward, gsd, interactive; null off sessions) and host (oci, or the machine a synced session root names; null off sessions), so a tombstone is filtered like the doc it removes.",
     "Under QMD_UNTIL, head is the newest position visible under the ceiling, so complete stays reachable for a replaying consumer."
   ],
   "type": "object",
@@ -88,6 +88,13 @@
               null
             ],
             "description": "Session origin label carried by the version itself; null for non-session sources, and interactive for a session doc written before origins."
+          },
+          "host": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Session host carried by the version itself; null for non-session sources, and oci for a session doc written before hosts."
           },
           "time": {
             "type": [

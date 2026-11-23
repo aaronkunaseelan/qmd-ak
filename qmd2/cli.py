@@ -103,6 +103,8 @@ def grep_command(reader, args):
             args.limit,
             origins=args.origin,
             not_origins=args.not_origin,
+            hosts=args.host,
+            not_hosts=args.not_host,
         )
     )
     print(
@@ -191,6 +193,28 @@ def origin_flags(parser):
     )
 
 
+HOST_HELP = 'Session host: a comma list of machine labels, oci for sessions from this machine.'
+
+
+def host_labels(value):
+    labels = [label.strip() for label in value.split(',') if label.strip()]
+    if not labels:
+        raise argparse.ArgumentTypeError(HOST_HELP)
+    return labels
+
+
+def host_flags(parser):
+    parser.add_argument(
+        '--host', type=host_labels, metavar='LABELS', help=HOST_HELP + ' Non-session items fail it.'
+    )
+    parser.add_argument(
+        '--not-host',
+        type=host_labels,
+        metavar='LABELS',
+        help=HOST_HELP + ' Non-session items pass it.',
+    )
+
+
 def add_read_parsers(commands):
     get = commands.add_parser(
         'get',
@@ -243,6 +267,7 @@ def add_read_parsers(commands):
     grep.add_argument('--limit', type=int, default=100)
     grep.add_argument('--json', action='store_true')
     origin_flags(grep)
+    host_flags(grep)
     get.add_argument('--cold', action='store_true', help=argparse.SUPPRESS)
 
 
@@ -268,6 +293,7 @@ def build_parser():
     search.add_argument('--limit', type=int, default=10)
     search.add_argument('--json', action='store_true')
     origin_flags(search)
+    host_flags(search)
     add_read_parsers(commands)
     attachments = commands.add_parser('attachments').add_subparsers(
         dest='attachment_command', required=True
@@ -323,6 +349,7 @@ def build_parser():
     browse.add_argument('--cursor', type=int, default=0)
     browse.add_argument('--json', action='store_true')
     origin_flags(browse)
+    host_flags(browse)
     from .sources import SOURCES
 
     feed = commands.add_parser(
@@ -336,6 +363,7 @@ def build_parser():
     feed.add_argument('--limit', type=int, default=500)
     feed.add_argument('--json', action='store_true', required=True)
     origin_flags(feed)
+    host_flags(feed)
     contract = commands.add_parser('contract')
     contract.add_argument('id', choices=['qmd.status.v1', 'qmd.feed.v1', 'qmd.extract.v1'])
     stat = commands.add_parser(
@@ -435,6 +463,8 @@ def search_command(home, args):
         args.until,
         origins=args.origin,
         not_origins=args.not_origin,
+        hosts=args.host,
+        not_hosts=args.not_host,
     )
     if args.json:
         print(dumps([discovery_row(row) for row in rows]))
@@ -610,6 +640,8 @@ def browse_command(home, args):
         args.cursor,
         origins=args.origin,
         not_origins=args.not_origin,
+        hosts=args.host,
+        not_hosts=args.not_host,
     )
     if args.json:
         reader = Reader(home)
@@ -686,13 +718,15 @@ def reindex_command(home, args, parser):
     print(dumps(result['revived']) if args.revive_reset else 'reindex complete')
 
 
-def feed_items(items, origins, not_origins):
-    """Feed items carry their own origin; only session docs have one."""
+def feed_items(items, origins, not_origins, hosts=None, not_hosts=None):
+    """Feed items carry their own origin and host; only session docs have them."""
     return [
         entry
         for entry in items
         if (not origins or entry['origin'] in origins)
         and entry['origin'] not in (not_origins or ())
+        and (not hosts or entry['host'] in hosts)
+        and entry['host'] not in (not_hosts or ())
     ]
 
 
@@ -741,8 +775,10 @@ def main():
             feed = Feed(home, args.source)
             try:
                 result = feed.read(args.after, args.since_arrival, args.limit)
-                if args.origin or args.not_origin:
-                    result['items'] = feed_items(result['items'], args.origin, args.not_origin)
+                if args.origin or args.not_origin or args.host or args.not_host:
+                    result['items'] = feed_items(
+                        result['items'], args.origin, args.not_origin, args.host, args.not_host
+                    )
                 print(dumps(result))
             except ValueError as exc:
                 parser.error(str(exc))

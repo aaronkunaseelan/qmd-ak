@@ -33,6 +33,7 @@ def item(source, pointer, header, doc):
         source=source,
         kind=doc.get('kind'),
         origin=(doc.get('origin') or 'interactive') if doc.get('group') == 'sessions' else None,
+        host=(doc.get('host') or 'oci') if doc.get('group') == 'sessions' else None,
         time=date(doc['time']).timestamp() if doc.get('time') not in (None, '') else None,
         arrived=header.get('arrived'),
         title=doc.get('title'),

@@ -393,6 +393,8 @@ def test_inventory_keeps_listing_past_a_dangling_symlink(tmp_path):
 
 
 def test_filesystem_subprocess_tail_spool_and_cli(tmp_path):
+    from qmd2.sources.sessions import ROOTS
+
     lease = tmp_path / 'heavy.lock'
     env = dict(os.environ, HOME=str(tmp_path), QMD2_HEAVY_LEASE=str(lease))
 
@@ -401,13 +403,7 @@ def test_filesystem_subprocess_tail_spool_and_cli(tmp_path):
             [sys.executable, '-m', *args], env=env, capture_output=True, text=True, check=True
         )
 
-    roots = [
-        'agents/pi/sessions',
-        '.codex/sessions',
-        '.claude/projects',
-        'agents/codex/sessions',
-        'agents/claude-code/projects',
-    ]
+    roots = [str(root.relative_to(Path.home())) for _, root in ROOTS]
     store = tmp_path / '.local/share/qmd2'
     run('qmd2.ingestd', '--home', str(store), '--no-b2', '--once')
     snapshot = json.loads((store / 'status.json').read_text())

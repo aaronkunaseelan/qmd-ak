@@ -13,6 +13,7 @@ from qmd2.doc import render, version
 from qmd2.index import Index
 from qmd2.packs import Packs
 from qmd2.policy import text
+from qmd2.sources import sessions
 from qmd2.sources.sessions import context, import_context, lines, origin, parse, prepare
 from qmd2.state import State
 
@@ -228,6 +229,47 @@ def test_parser_table(runtime, row, kind, body):
         assert docs[0]['id'].endswith('#' + str(native or 17))
 
 
+def test_remote_root_inventory(tmp_path, monkeypatch):
+    monkeypatch.setattr(sessions, 'REMOTE', tmp_path / 'agents/remote')
+    roots = []
+    for runtime in ('claude', 'codex', 'pi'):
+        root = tmp_path / 'agents/remote/mac-air' / runtime
+        root.mkdir(parents=True)
+        (root / 'session.jsonl').write_text('{}\n')
+        roots.append((runtime, root))
+    found, failed = sessions.inventory(roots)
+    assert {(runtime, path.parent.name) for runtime, path, _ in found} == {
+        (runtime, runtime) for runtime in ('claude', 'codex', 'pi')
+    }
+    assert failed == {}
+
+
+@pytest.mark.parametrize('runtime', ['claude', 'codex', 'pi'])
+def test_remote_session_key_names_its_host(tmp_path, monkeypatch, runtime):
+    monkeypatch.setattr(sessions, 'REMOTE', tmp_path / 'agents/remote')
+    row = {
+        'type': 'user',
+        'uuid': 'u1',
+        'cwd': '/Users/sak/Documents/workbench',
+        'message': {'role': 'user', 'content': 'synthetic lighthouse'},
+    }
+    raw = json.dumps(row).encode()
+    keys = {}
+    for path in (
+        tmp_path / 'local/session.jsonl',
+        tmp_path / 'agents/remote/mac-air' / runtime / 'session.jsonl',
+    ):
+        ctx = dict(context(path, runtime), offset=17)
+        doc = parse(raw, prepare(row, ctx))[0]
+        assert doc['origin'] == 'interactive'
+        keys[doc['host']] = doc['id']
+    # This machine's keys are unchanged; a remote host's own key keeps equal file names apart.
+    assert keys == {
+        'oci': f'{runtime}:session#u1',
+        'mac-air': f'{runtime}:mac-air:session#u1',
+    }
+
+
 @pytest.mark.parametrize('runtime', ['pi', 'claude', 'codex'])
 def test_source_chain(tmp_path, runtime):
     state = State(tmp_path, True)
@@ -278,6 +320,9 @@ def test_origin_end_to_end(tmp_path, runtime):
         '.codex/sessions',
         'agents/codex/sessions',
         'agents/pi/sessions',
+        'agents/remote/mac-air/claude',
+        'agents/remote/mac-air/codex',
+        'agents/remote/mac-air/pi',
     ):
         (home / name).mkdir(parents=True)
     # Working directories copied from real session records: steward wakes, a gsd run, and work.
@@ -314,6 +359,22 @@ def test_origin_end_to_end(tmp_path, runtime):
             b''.join(json.dumps(r).encode() + b'\n' for r in rows)
         )
 
+    # A session synced from the Air: the working directory on that machine stays interactive.
+    air = home / 'agents/remote/mac-air/claude/air.jsonl'
+    air.write_bytes(
+        json.dumps(
+            {
+                'type': 'user',
+                'uuid': 'r1',
+                'sessionId': 'air',
+                'cwd': '/Users/sak/Documents/workbench',
+                'timestamp': '2026-10-13T01:00:00Z',
+                'message': {'role': 'user', 'content': 'remote lighthouse'},
+            }
+        ).encode()
+        + b'\n'
+    )
+
     def cli(*args, check=True, extra=None):
         return subprocess.run(
             [sys.executable, '-m', 'qmd2.cli', '--home', str(store), *args],
@@ -348,6 +409,28 @@ def test_origin_end_to_end(tmp_path, runtime):
         'steward': runtime + ':steward',
         'interactive': runtime + ':interactive',
     }
+    remote = [dict(item=runtime + ':mac-air:air', host='mac-air', origin='interactive')]
+    searched = json.loads(cli('search', 'remote lighthouse', '--json').stdout)
+    assert [{k: row[k] for k in ('item', 'host', 'origin')} for row in searched] == remote
+    assert json.loads(cli('search', 'remote lighthouse', '--host', 'oci', '--json').stdout) == []
+    assert (
+        json.loads(cli('search', 'remote lighthouse', '--not-host', 'mac-air', '--json').stdout)
+        == []
+    )
+    grepped = json.loads(
+        cli(
+            'grep',
+            'lighthouse',
+            '--since',
+            '2000-01-01',
+            '--until',
+            '2100-01-01',
+            '--host',
+            'mac-air',
+            '--json',
+        ).stdout
+    )
+    assert {row['id'].rsplit('#', 1)[0] for row in grepped} == {runtime + ':mac-air:air'}
     browsed = json.loads(
         cli(
             'browse',
@@ -360,7 +443,10 @@ def test_origin_end_to_end(tmp_path, runtime):
             '--json',
         ).stdout
     )
-    assert {row['item'] for row in browsed['results']} == {runtime + ':interactive'}
+    assert {row['item'] for row in browsed['results']} == {
+        runtime + ':interactive',
+        runtime + ':mac-air:air',
+    }
     assert {row['origin'] for row in browsed['results']} == {'interactive'}
     grepped = json.loads(
         cli(
@@ -376,6 +462,20 @@ def test_origin_end_to_end(tmp_path, runtime):
         ).stdout
     )
     assert {row['id'].rsplit('#', 1)[0] for row in grepped} == {runtime + ':interactive'}
+    fed = json.loads(
+        cli(
+            'feed',
+            '--source',
+            runtime,
+            '--after',
+            'qmd1.' + runtime + '.' + '0' * 20 + '.' + '0' * 20,
+            '--host',
+            'mac-air',
+            '--json',
+        ).stdout
+    )
+    assert {row['item'] for row in fed['items']} == {runtime + ':mac-air:air'}
+    assert {row['host'] for row in fed['items']} == {'mac-air'}
     fed = json.loads(
         cli(
             'feed',
@@ -399,7 +499,7 @@ def test_origin_end_to_end(tmp_path, runtime):
             '--json',
         ).stdout
     )
-    assert len(unfiltered['items']) == 6
+    assert len(unfiltered['items']) == 7
     for item in (runtime + ':steward', runtime + ':gsd', runtime + ':interactive'):
         assert 'beacon' in cli('get', item).stdout
     bogus = cli('search', 'origin synthetic', '--not-origin', 'interactive', check=False)
@@ -434,7 +534,10 @@ def test_origin_end_to_end(tmp_path, runtime):
     browsed = json.loads(
         cli('browse', '--source', runtime, '--limit', '100', '--json', extra=scoped).stdout
     )
-    assert {row['item'] for row in browsed['results']} == {runtime + ':interactive'}
+    assert {row['item'] for row in browsed['results']} == {
+        runtime + ':interactive',
+        runtime + ':mac-air:air',
+    }
     fed = json.loads(
         cli(
             'feed',
@@ -446,7 +549,10 @@ def test_origin_end_to_end(tmp_path, runtime):
             extra=scoped,
         ).stdout
     )
-    assert {row['item'] for row in fed['items']} == {runtime + ':interactive'}
+    assert {row['item'] for row in fed['items']} == {
+        runtime + ':interactive',
+        runtime + ':mac-air:air',
+    }
     assert 'beacon' in cli('get', runtime + ':steward', extra=scoped).stdout
     assert cli('status', '--json', extra=scoped).returncode == 0
     hidden = cli('search', 'origin synthetic', extra={'QMD_NOT_ORIGIN': 'interactive'}, check=False)

@@ -95,9 +95,19 @@ class Reader:
         return docs
 
     def scan(
-        self, source=None, since=None, until=None, query=None, origins=None, not_origins=None
+        self,
+        source=None,
+        since=None,
+        until=None,
+        query=None,
+        origins=None,
+        not_origins=None,
+        hosts=None,
+        not_hosts=None,
     ):
-        for row in self.index.scan(source, since, until, query, origins, not_origins):
+        for row in self.index.scan(
+            source, since, until, query, origins, not_origins, hosts, not_hosts
+        ):
             yield self.read(row)
 
     def source_docs(self, source):
@@ -190,9 +200,28 @@ class Reader:
         position = next(i for i, row in enumerate(ordered) if row['id'] == asked['id'])
         return [self.read(r) for r in ordered[max(0, position - around) : position + around + 1]]
 
-    def grep(self, pattern, since, until, sources, limit, origins=None, not_origins=None):
+    def grep(
+        self,
+        pattern,
+        since,
+        until,
+        sources,
+        limit,
+        origins=None,
+        not_origins=None,
+        hosts=None,
+        not_hosts=None,
+    ):
         count = 0
-        for doc in self.scan(sources, since, until, origins=origins, not_origins=not_origins):
+        for doc in self.scan(
+            sources,
+            since,
+            until,
+            origins=origins,
+            not_origins=not_origins,
+            hosts=hosts,
+            not_hosts=not_hosts,
+        ):
             for line in '\n'.join(p.get('text', '') for p in doc.get('parts', [])).splitlines():
                 if pattern.search(line):
                     yield dict(

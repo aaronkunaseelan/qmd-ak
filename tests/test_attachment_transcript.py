@@ -61,3 +61,17 @@ def test_a_transcriber_that_reports_no_engine_fails_loudly(tmp_path, monkeypatch
     with pytest.raises(OSError) as caught:
         attachments.transcribe(audio)
     assert str(caught.value) == 'engine label missing'
+
+
+def test_a_transcriber_that_heard_no_speech_is_no_text(tmp_path, monkeypatch, audio):
+    tool = tmp_path / 'transcribe.py'
+    tool.write_text(
+        'import sys\n'
+        'print("no speech detected in 12s of audio", file=sys.stderr)\n'
+        'sys.exit(3)\n'
+    )
+    monkeypatch.setattr(attachments, 'TOOL', tool)
+    # tg-tools says no engine heard speech: the audio's answer, as an image Vision reads empty.
+    with pytest.raises(attachments.Unavailable) as refused:
+        attachments.transcribe(audio)
+    assert str(refused.value) == 'no_text'

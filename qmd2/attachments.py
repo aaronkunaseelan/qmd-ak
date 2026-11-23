@@ -123,14 +123,17 @@ class ConverterTimeout(TimeoutError, Failed):
 
 
 class StageFailed(OSError):
-    """A stage of the pipeline refused: the label is one of this module's literals, never data.
+    """A stage refused: `stage` is this module's literal, `detail` its child's last stderr line.
 
-    `temporary_refusal` answers `stage_failed (<label>)`, temporary only for a disk floor.
+    `temporary_refusal` answers `stage_failed (<stage>: <detail>)`, temporary for a disk floor only.
+    `code` is the exit status when a child failed, so a caller can tell one exit from another.
     """
 
-    def __init__(self, stage):
+    def __init__(self, stage, detail='', code=None):
         super().__init__(stage)
         self.stage = stage
+        self.detail = detail
+        self.code = code
 
 
 def detect(body):
@@ -690,6 +693,12 @@ def converter_failure(code):
     return f'converter failed ({ended})'
 
 
+def stderr_tail(detail):
+    """The child's last non-blank stderr line, bounded at 200: a cause, not a transcript."""
+    lines = [line.strip() for line in detail.splitlines() if line.strip()]
+    return lines[-1][:200] if lines else ''
+
+
 def run(argv, timeout=120, data=None, azure=False):
     env = {
         'HOME': str(Path.home()),
@@ -715,9 +724,9 @@ def run(argv, timeout=120, data=None, azure=False):
             p.wait()
             raise ConverterTimeout('converter deadline')
         if p.returncode:
+            errors.seek(0)
+            detail = errors.read(1024**2).decode(errors='replace')
             if azure:
-                errors.seek(0)
-                detail = errors.read(1024**2).decode(errors='replace')
                 if 'Missing Azure' in detail or re.search(r'(?:error|HTTP) (?:401|403)\b', detail):
                     raise Failed('azure_auth_or_config')
                 if re.search(r'(?:error|HTTP) 4(?:00|04|10|13|15|22)\b', detail):
@@ -727,7 +736,8 @@ def run(argv, timeout=120, data=None, azure=False):
                     raise urllib.error.HTTPError(
                         '', int(status[1]), 'Azure temporary refusal', None, None
                     )
-            raise StageFailed(converter_failure(p.returncode))
+            # The child's last stderr line names its cause; this process's environment never does.
+            raise StageFailed(converter_failure(p.returncode), stderr_tail(detail), p.returncode)
         output.seek(0)
         body = output.read(LIMIT + 1)
         if len(body) > LIMIT:
@@ -1268,22 +1278,28 @@ def transcribe(path):
     handle, engine = tempfile.mkstemp(prefix='transcribe-engine-', suffix='.json')
     os.close(handle)
     try:
-        output = run(
-            [
-                sys.executable,
-                str(TOOL),
-                str(path),
-                '--raw',
-                '--model',
-                'mini',
-                '--jobs',
-                '1',
-                '--engine-file',
-                engine,
-            ],
-            timeout=360,
-            azure=True,
-        )
+        try:
+            output = run(
+                [
+                    sys.executable,
+                    str(TOOL),
+                    str(path),
+                    '--raw',
+                    '--model',
+                    'mini',
+                    '--jobs',
+                    '1',
+                    '--engine-file',
+                    engine,
+                ],
+                timeout=360,
+                azure=True,
+            )
+        except StageFailed as error:
+            # tg-tools exits 3 when no engine heard speech: the audio's answer, not a failure.
+            if error.code != 3:
+                raise
+            raise Unavailable('no_text') from None
         try:
             reported = json.loads(Path(engine).read_text())
             label = f'{reported["provider"]}:{reported["model"]}'
@@ -1938,7 +1954,8 @@ def temporary_refusal(error):
     if isinstance(error, StageFailed):
         # A disk floor is a condition that passes; every other stage is this pipeline's own refusal.
         kind = 'temporary' if error.stage == 'disk floor' else 'permanent'
-        return kind, f'stage_failed ({error.stage})'
+        cause = f': {error.detail}' if error.detail else ''
+        return kind, f'stage_failed ({error.stage}{cause})'
     if isinstance(error, urllib.error.HTTPError):
         if error.code in (403, 451):
             return 'blocked', f'remote_blocked (HTTP {error.code})'
